@@ -49,7 +49,7 @@ jobs:
             echo "Package tarball contains a forbidden secret-like file" >&2
             exit 1
           fi
-          echo "$TARBALL" > pack/tarball-path.txt
+          realpath "$TARBALL" > pack/tarball-path.txt
 
       - name: Clean install and import smoke
         run: |
