@@ -1,0 +1,45 @@
+{
+  "name": "@allstak/fastify",
+  "version": "0.1.0-beta.1",
+  "description": "Standalone AllStak Fastify SDK. No @allstak/* runtime dependencies.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allstak-io/allstak-fastify.git"
+  },
+  "homepage": "https://allstak.sa",
+  "bugs": {
+    "url": "https://github.com/allstak-io/allstak-fastify/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
+    "test": "vitest run",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "fastify": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "fastify": { "optional": true }
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.6.1"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
