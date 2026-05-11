@@ -22,10 +22,9 @@ import allstakFastify from "@allstak/fastify";
 
 const app = Fastify();
 await app.register(allstakFastify, {
-  dsn: process.env.ALLSTAK_DSN,
-  endpoint: "https://api.allstak.sa",
+  apiKey: process.env.ALLSTAK_API_KEY!,
+  environment: process.env.NODE_ENV ?? "production",
   release: process.env.RELEASE,
-  environment: process.env.NODE_ENV,
 });
 ```
 
