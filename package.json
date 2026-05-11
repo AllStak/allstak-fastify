@@ -15,11 +15,11 @@
   "files": ["dist", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/allstak-io/allstak-fastify.git"
+    "url": "git+https://github.com/AllStak/allstak-fastify.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
-    "url": "https://github.com/allstak-io/allstak-fastify/issues"
+    "url": "https://github.com/AllStak/allstak-fastify/issues"
   },
   "publishConfig": {
     "access": "public"
