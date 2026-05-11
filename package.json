@@ -22,7 +22,8 @@
     "url": "https://github.com/AllStak/allstak-fastify/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
