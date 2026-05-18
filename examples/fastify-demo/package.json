@@ -1,0 +1,16 @@
+{
+  "name": "allstak-fastify-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo Fastify app with @allstak/fastify plugin",
+  "scripts": {
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "fastify": "^4.29.1",
+    "@allstak/fastify": "file:../../"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}
