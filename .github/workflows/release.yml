@@ -49,7 +49,7 @@ jobs:
         run: |
           set +e
           hits=$(grep -rEn --include='*.md' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.ts' --include='*.js' \
-            "allstak-io" . | grep -vE "_archive|CHANGELOG|HISTORY|/dist/|/node_modules/|Previous|archived|legacy|historical|read-only" | wc -l | tr -d ' ')
+            "allstak-io" . | grep -vE "_archive|CHANGELOG|HISTORY|/dist/|/node_modules/|Previous|archived|legacy|historical|read-only|/\.github/workflows/" | wc -l | tr -d ' ')
           if [ "$hits" != "0" ]; then
             echo "::error::active allstak-io references found"
             exit 1
