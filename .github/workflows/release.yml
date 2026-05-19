@@ -95,7 +95,9 @@ jobs:
       - run: npm ci
       - run: npm run build --if-present
       - name: Pack tarball
-        run: npm pack --pack-destination dist-pack
+        run: |
+          mkdir -p dist-pack
+          npm pack --pack-destination dist-pack
       - name: List tarball contents (job summary)
         run: |
           TGZ=$(ls dist-pack/*.tgz | head -1)
