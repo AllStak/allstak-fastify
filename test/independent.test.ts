@@ -30,7 +30,7 @@ describe('@allstak/fastify — plugin', () => {
     };
     allstakFastify(app, {
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       flushIntervalMs: 0,
       fetch: fetchSpy as unknown as typeof fetch,
     });
@@ -48,12 +48,28 @@ describe('@allstak/fastify — plugin', () => {
     hooks.onResponse(request, reply, () => {});
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     expect(responseHeaders['x-allstak-trace-id']).toBe('a'.repeat(32));
+    expect(responseHeaders.baggage).toContain(`allstak-trace_id=${'a'.repeat(32)}`);
+    expect(responseHeaders['allstak-baggage']).toContain('allstak-request_id=req-fastify-test');
     const init = fetchSpy.mock.calls[0][1];
     expect(init.headers['User-Agent']).toBe(`${SDK_NAME}/${SDK_VERSION}`);
     const row = JSON.parse(init.body).requests[0];
     expect(row.path).toBe('/health');
+    expect(row.requestId).toBe('req-fastify-test');
+    expect(row.spanId).toMatch(/^[0-9a-f]{16}$/);
+    expect(row.parentSpanId).toBe('b'.repeat(16));
+    expect(row.metadata.requestId).toBeUndefined();
     expect(row.metadata['sdk.version']).toBe(SDK_VERSION);
     expect(row.requestHeaders).toBe('');
+    await vi.waitFor(() => expect(fetchSpy.mock.calls.some(([url]) => String(url).endsWith('/ingest/v1/spans'))).toBe(true));
+    const spanCall = fetchSpy.mock.calls.find(([url]) => String(url).endsWith('/ingest/v1/spans'))!;
+    const span = JSON.parse(spanCall[1].body).spans[0];
+    expect(span).toMatchObject({
+      traceId: 'a'.repeat(32),
+      operation: 'fastify.request',
+      description: 'GET /health',
+      status: 'ok',
+      environment: '',
+    });
   });
 
   it('captures redacted headers when captureRequestHeaders=true', async () => {
@@ -124,9 +140,13 @@ describe('@allstak/fastify — plugin', () => {
     // Pull the transport off the app and force-flush.
     const transport = (app as any)[Object.getOwnPropertySymbols(app)[0]] as FastifyTransport;
     await transport.forceFlush();
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    const httpCalls = fetchSpy.mock.calls.filter(([url]) => String(url).endsWith('/ingest/v1/http-requests'));
+    const spanCalls = fetchSpy.mock.calls.filter(([url]) => String(url).endsWith('/ingest/v1/spans'));
+    expect(httpCalls).toHaveLength(1);
+    expect(spanCalls).toHaveLength(1);
+    const body = JSON.parse(httpCalls[0][1].body);
     expect(body.requests).toHaveLength(5);
+    expect(JSON.parse(spanCalls[0][1].body).spans).toHaveLength(5);
   });
 
   it('sampleRate=0 drops every inbound', async () => {
@@ -188,7 +208,7 @@ describe('@allstak/fastify — plugin', () => {
     const { app, hooks } = makeApp();
     allstakFastify(app, {
       apiKey: 'ask_dev_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       flushIntervalMs: 0,
       fetch: fetchSpy as unknown as typeof fetch,
     });
@@ -205,7 +225,7 @@ describe('@allstak/fastify — plugin', () => {
     const payload = JSON.parse(fetchSpy.mock.calls[0][1].body);
     expect(payload.traceId).toBe('c'.repeat(32));
     expect(payload.metadata['sdk.version']).toBe(SDK_VERSION);
-    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.dev.allstak.sa/ingest/v1/errors');
+    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.allstak.sa/ingest/v1/errors');
   });
 
   it('default and named export are the same plugin function', () => {

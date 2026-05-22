@@ -52,7 +52,7 @@ export interface AllStakFastifyConfig {
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors';
+  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans';
   payload: Record<string, unknown>;
 }
 
@@ -122,6 +122,22 @@ function traceparent(traceId: string, spanId: string): string {
   return `00-${t}-${s}-01`;
 }
 
+function allstakBaggage(traceId: string, requestId: string, spanId: string): string {
+  return [
+    `allstak-trace_id=${traceId}`,
+    `allstak-request_id=${requestId}`,
+    `allstak-span_id=${spanId}`,
+  ].join(',');
+}
+
+function mergeBaggage(existing: string, traceId: string, requestId: string, spanId: string): string {
+  const preserved = existing
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => part && !part.toLowerCase().startsWith('allstak-'));
+  return [...preserved, ...allstakBaggage(traceId, requestId, spanId).split(',')].join(',');
+}
+
 interface QueuedEvent {
   ev: AllStakOutboundEvent;
 }
@@ -143,6 +159,7 @@ class FastifyTransport {
   private readonly beforeSend?: AllStakFastifyConfig['beforeSend'];
 
   private requestQueue: QueuedEvent[] = [];
+  private spanQueue: QueuedEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
   private dropped = 0;
@@ -162,7 +179,7 @@ class FastifyTransport {
   }
 
   stats(): { inFlight: number; dropped: number; queued: number } {
-    return { inFlight: this.inFlight, dropped: this.dropped, queued: this.requestQueue.length };
+    return { inFlight: this.inFlight, dropped: this.dropped, queued: this.requestQueue.length + this.spanQueue.length };
   }
 
   async forceFlush(): Promise<void> {
@@ -171,6 +188,7 @@ class FastifyTransport {
       this.timer = null;
     }
     await this.drainRequests();
+    await this.drainSpans();
   }
 
   async shutdown(timeoutMs = 1500): Promise<void> {
@@ -197,6 +215,21 @@ class FastifyTransport {
     }
   }
 
+  /** Batched. Used for /spans where every request can emit a server span. */
+  enqueueSpan(ev: AllStakOutboundEvent): void {
+    if (!this.apiKey || this.shuttingDown) return;
+    if (this.spanQueue.length >= this.maxQueueSize) {
+      this.spanQueue.shift();
+      this.dropped++;
+    }
+    this.spanQueue.push({ ev });
+    if (this.flushIntervalMs <= 0 || this.spanQueue.length >= this.maxBatchSize) {
+      void this.drainSpans();
+    } else {
+      this.scheduleFlush();
+    }
+  }
+
   /** Single-shot. Used for /errors. */
   sendNow(ev: AllStakOutboundEvent): void {
     if (!this.apiKey || this.shuttingDown) return;
@@ -207,7 +240,7 @@ class FastifyTransport {
     if (this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      void this.drainRequests();
+      void Promise.all([this.drainRequests(), this.drainSpans()]);
     }, this.flushIntervalMs);
     const t = this.timer as unknown as { unref?: () => void };
     if (typeof t.unref === 'function') t.unref();
@@ -225,6 +258,22 @@ class FastifyTransport {
       const mergedEv: AllStakOutboundEvent = {
         path: '/ingest/v1/http-requests',
         payload: { requests: merged },
+      };
+      await this.dispatch(mergedEv);
+    }
+  }
+
+  private async drainSpans(): Promise<void> {
+    while (this.spanQueue.length > 0) {
+      const batch = this.spanQueue.splice(0, this.maxBatchSize);
+      const merged: Record<string, unknown>[] = [];
+      for (const { ev } of batch) {
+        const rows = (ev.payload as { spans?: unknown[] }).spans;
+        if (Array.isArray(rows)) merged.push(...(rows as Record<string, unknown>[]));
+      }
+      const mergedEv: AllStakOutboundEvent = {
+        path: '/ingest/v1/spans',
+        payload: { spans: merged },
       };
       await this.dispatch(mergedEv);
     }
@@ -350,6 +399,8 @@ export function allstakFastify(
     request.allstakParentSpanId =
       headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
     reply.header?.('traceparent', traceparent(traceId, spanId));
+    reply.header?.('baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
+    reply.header?.('allstak-baggage', allstakBaggage(traceId, requestId, spanId));
     reply.header?.('x-allstak-trace-id', traceId);
     reply.header?.('x-allstak-request-id', requestId);
     doneHook();
@@ -362,19 +413,26 @@ export function allstakFastify(
     }
     const startedAt = request.allstakStartedAt || Date.now();
     const userId = request.user?.id == null ? undefined : String(request.user.id);
+    const durationMs = Math.max(0, Date.now() - startedAt);
+    const path = pathOnly(request.url);
+    const method = request.method.toUpperCase();
+    const statusCode = reply.statusCode;
+    const traceId = request.allstakTraceId || '';
+    const spanId = request.allstakSpanId || '';
     const payload: Record<string, unknown> = {
       requests: [
         {
           direction: 'inbound',
-          method: request.method.toUpperCase(),
+          method,
           host: requestHost(request),
-          path: pathOnly(request.url),
-          statusCode: reply.statusCode,
-          durationMs: Math.max(0, Date.now() - startedAt),
+          path,
+          statusCode,
+          durationMs,
           timestamp: new Date(startedAt).toISOString(),
-          traceId: request.allstakTraceId || '',
-          spanId: request.allstakSpanId || '',
+          traceId,
+          spanId,
           parentSpanId: request.allstakParentSpanId || '',
+          requestId: request.allstakRequestId || '',
           environment: config.environment || '',
           release: config.release || '',
           service: config.serviceName || '',
@@ -384,7 +442,6 @@ export function allstakFastify(
             : '',
           metadata: redactMap(
             {
-              requestId: request.allstakRequestId || '',
               'sdk.name': SDK_NAME,
               'sdk.version': SDK_VERSION,
             },
@@ -394,6 +451,33 @@ export function allstakFastify(
       ],
     };
     transport.enqueueRequest({ path: '/ingest/v1/http-requests', payload });
+    transport.enqueueSpan({
+      path: '/ingest/v1/spans',
+      payload: {
+        spans: [
+          {
+            traceId,
+            spanId,
+            parentSpanId: request.allstakParentSpanId || '',
+            operation: 'fastify.request',
+            description: `${method} ${path}`,
+            status: statusCode >= 500 ? 'error' : 'ok',
+            durationMs,
+            startTimeMillis: startedAt,
+            endTimeMillis: startedAt + durationMs,
+            service: config.serviceName || '',
+            environment: config.environment || '',
+            release: config.release || '',
+            tags: {
+              component: 'fastify',
+              method,
+              statusCode: String(statusCode),
+            },
+            data: JSON.stringify({ host: requestHost(request), path }),
+          },
+        ],
+      },
+    });
     doneHook();
   });
 
@@ -406,6 +490,9 @@ export function allstakFastify(
       environment: config.environment || '',
       release: config.release || '',
       traceId: request.allstakTraceId || '',
+      spanId: request.allstakSpanId || '',
+      parentSpanId: request.allstakParentSpanId || '',
+      requestId: request.allstakRequestId || '',
       metadata: redactMap(
         {
           'sdk.name': SDK_NAME,
@@ -413,8 +500,6 @@ export function allstakFastify(
           service: config.serviceName || '',
           httpMethod: request.method,
           httpPath: pathOnly(request.url),
-          requestId: request.allstakRequestId || '',
-          spanId: request.allstakSpanId || '',
         },
         extraRedact,
       ),

@@ -36,7 +36,7 @@ async function buildApp(): Promise<FastifyInstance> {
   // encapsulated child context) — the standard Fastify registration pattern.
   await app.register(allstakFastify, {
     apiKey: 'ask_dev_test',
-    host: 'https://api.dev.allstak.sa',
+    host: 'https://api.allstak.sa',
     environment: 'test',
     release: 'fastify-validation@1.0.0',
     serviceName: 'fastify-validation',
@@ -64,6 +64,8 @@ describe('@allstak/fastify against real Fastify v4', () => {
       expect(res.headers['x-allstak-trace-id']).toMatch(/^[0-9a-f]{32}$/);
       expect(res.headers['x-allstak-request-id']).toBeTruthy();
       expect(String(res.headers.traceparent)).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      expect(String(res.headers['allstak-baggage'])).toContain(`allstak-trace_id=${res.headers['x-allstak-trace-id']}`);
+      expect(String(res.headers.baggage)).toContain(`allstak-request_id=${res.headers['x-allstak-request-id']}`);
 
       // Wait for the fire-and-forget send() to land.
       await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0), { timeout: 500 });
@@ -74,6 +76,17 @@ describe('@allstak/fastify against real Fastify v4', () => {
       expect(row.method).toBe('GET');
       expect(row.statusCode).toBe(200);
       expect(row.traceId).toBe(res.headers['x-allstak-trace-id']);
+      expect(row.requestId).toBe(res.headers['x-allstak-request-id']);
+      expect(row.spanId).toMatch(/^[0-9a-f]{16}$/);
+      expect(row.metadata.requestId).toBeUndefined();
+      const spanReq = calls.find((c) => c.url.endsWith('/ingest/v1/spans'));
+      expect(spanReq, 'span payload must be emitted').toBeTruthy();
+      expect(spanReq!.body.spans[0]).toMatchObject({
+        traceId: res.headers['x-allstak-trace-id'],
+        operation: 'fastify.request',
+        description: 'GET /health',
+        status: 'ok',
+      });
     } finally { await app.close(); }
   });
 
@@ -111,6 +124,8 @@ describe('@allstak/fastify against real Fastify v4', () => {
       expect(errCall.body.message).toBe('intentional boom');
       expect(errCall.body.metadata.httpPath).toBe('/boom');
       expect(errCall.body.traceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(errCall.body.requestId).toMatch(/^[0-9a-f]{32}$|^req-/);
+      expect(errCall.body.spanId).toMatch(/^[0-9a-f]{16}$/);
     } finally { await app.close(); }
   });
 
@@ -131,16 +146,18 @@ describe('@allstak/fastify against real Fastify v4', () => {
       // Both registrations target the SAME underlying Fastify instance.
       // The plugin must be idempotent and not double-emit.
       // Use the named export to also verify backward-compat direct-call style.
-      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.dev.allstak.sa', flushIntervalMs: 0 });
-      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.dev.allstak.sa', flushIntervalMs: 0 });
-      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.dev.allstak.sa', flushIntervalMs: 0 });
+      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.allstak.sa', flushIntervalMs: 0 });
+      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.allstak.sa', flushIntervalMs: 0 });
+      namedExport(app, { apiKey: 'ask_dev_test', host: 'https://api.allstak.sa', flushIntervalMs: 0 });
       app.get('/x', async () => 'ok');
 
       const res = await app.inject({ method: 'GET', url: '/x' });
       expect(res.statusCode).toBe(200);
       await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0), { timeout: 500 });
       const httpReqs = calls.filter((c) => c.url.endsWith('/ingest/v1/http-requests'));
+      const spanReqs = calls.filter((c) => c.url.endsWith('/ingest/v1/spans'));
       expect(httpReqs).toHaveLength(1);
+      expect(spanReqs).toHaveLength(1);
     } finally { await app.close(); }
   });
 });
