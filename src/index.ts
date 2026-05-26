@@ -72,6 +72,7 @@ export function parseRetryAfter(headerValue: string | null, now: number): number
 // Per-version Symbol so two different versions of @allstak/fastify in the same
 // process do not silently hand each other the same "already registered" flag.
 const REGISTERED_FLAG = Symbol.for(`@allstak/fastify@${SDK_VERSION}.registered`);
+const runtimeReleaseRegistrations = new Set<string>();
 
 export interface AllStakFastifyConfig {
   apiKey?: string;
@@ -89,6 +90,11 @@ export interface AllStakFastifyConfig {
    * gate off the git lookup and version fallback (explicit/env still apply).
    */
   autoDetectRelease?: boolean;
+  /**
+   * Register the resolved release with AllStak from the server runtime at
+   * plugin registration, without requiring a CI/CD hook. Default true.
+   */
+  autoRegisterRelease?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. */
@@ -133,7 +139,7 @@ export interface AllStakFastifyConfig {
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans';
+  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans' | '/ingest/v1/releases';
   payload: Record<string, unknown>;
 }
 
@@ -176,6 +182,37 @@ function releaseOf(config: AllStakFastifyConfig): string {
     gitRunner: config.gitRunner,
     version: SDK_VERSION,
   });
+}
+
+function registerRuntimeRelease(config: AllStakFastifyConfig, transport: FastifyTransport, release: string): void {
+  if (!shouldAutoRegisterRelease(config.autoRegisterRelease) || !release) return;
+  const host = normalizeHost(config.host || config.endpoint);
+  const apiKey = config.apiKey || config.dsn || '';
+  if (!apiKey) return;
+  const environment = config.environment || 'production';
+  const key = `${host}|${apiKey}|${environment}|${release}`;
+  if (runtimeReleaseRegistrations.has(key)) return;
+  runtimeReleaseRegistrations.add(key);
+  transport.sendNow({
+    path: '/ingest/v1/releases',
+    payload: {
+      version: release,
+      environment,
+      author: `${SDK_NAME}/${SDK_VERSION}`,
+      message: 'Registered automatically by AllStak Fastify SDK at runtime',
+    },
+  });
+}
+
+function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  try {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+  } catch {
+    return true;
+  }
 }
 
 function pathOnly(url: string): string {
@@ -658,6 +695,11 @@ export function _getMergedScope(): MergedScopeData {
   return scopeManager.getMerged();
 }
 
+/** @internal */
+export function _resetRuntimeReleaseRegistrationForTest(): void {
+  runtimeReleaseRegistrations.clear();
+}
+
 export function allstakFastify(
   fastify: FastifyLike,
   config: AllStakFastifyConfig,
@@ -683,6 +725,7 @@ export function allstakFastify(
   // (Node runtime, cached one-shot) > SDK version. Reused by every emitted
   // event for this plugin instance.
   const release = releaseOf(config);
+  registerRuntimeRelease(config, transport, release);
 
   // Register this plugin instance as the active capture context so module-level
   // captureException/captureMessage route through this transport + pipeline.
