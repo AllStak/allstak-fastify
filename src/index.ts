@@ -594,7 +594,7 @@ export function captureException(error: unknown, hint?: { extra?: Record<string,
 
 /**
  * Capture a freeform message on demand through the active plugin transport.
- * Routed to the errors stream (parity with @sentry/node captureMessage).
+ * Routed to the errors stream.
  */
 export function captureMessage(message: string, level: Severity = 'info'): void {
   const ctx = activeContext;
