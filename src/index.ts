@@ -1,6 +1,7 @@
 import fp from 'fastify-plugin';
 import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, redactHeadersToString, redactMap } from './redaction';
+import { resolveRelease, type GitRunner } from './release';
 import {
   Scope,
   ScopeManager,
@@ -13,6 +14,17 @@ import {
 export { SDK_NAME, SDK_VERSION } from './version';
 export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
+export {
+  resolveRelease,
+  resolveGitRelease,
+  detectReleaseFromEnv,
+  isNodeRuntime,
+  defaultGitRunner,
+  RELEASE_ENV_VARS,
+  _resetReleaseCache,
+  type ResolveReleaseOptions,
+} from './release';
+export type { GitRunner } from './release';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 const DEFAULT_TIMEOUT_MS = 3000;
@@ -69,6 +81,16 @@ export interface AllStakFastifyConfig {
   environment?: string;
   release?: string;
   serviceName?: string;
+  /**
+   * Auto-detect the release when `release` is not set: env vars
+   * (ALLSTAK_RELEASE, RAILWAY_GIT_COMMIT_SHA, RENDER_GIT_COMMIT, …), then local
+   * git at init (`git describe`/short SHA, Node runtime only, cached one-shot),
+   * then the SDK version so release is never empty. Default true. Set false to
+   * gate off the git lookup and version fallback (explicit/env still apply).
+   */
+  autoDetectRelease?: boolean;
+  /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
+  gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. */
   redactKeys?: (string | RegExp)[];
   /** Capture inbound headers (redacted). Default false. */
@@ -140,6 +162,20 @@ interface FastifyLike {
 
 function normalizeHost(host?: string): string {
   return (host || DEFAULT_HOST).replace(/\/$/, '');
+}
+
+/**
+ * Resolve the effective release for a config: explicit `release` > env vars >
+ * local git at init > SDK version. The git lookup is cached one-shot inside
+ * resolveRelease.
+ */
+function releaseOf(config: AllStakFastifyConfig): string {
+  return resolveRelease({
+    explicit: config.release,
+    autoDetectRelease: config.autoDetectRelease,
+    gitRunner: config.gitRunner,
+    version: SDK_VERSION,
+  });
 }
 
 function pathOnly(url: string): string {
@@ -474,6 +510,8 @@ interface ActiveCaptureContext {
   extraRedact: RegExp[];
   sampleRate: number;
   random: () => number;
+  /** Release resolved once at registration (explicit > env > git > version). */
+  release: string;
 }
 
 let activeContext: ActiveCaptureContext | null = null;
@@ -529,7 +567,7 @@ function buildErrorPayload(
     stackTrace: error.stack ? error.stack.split('\n') : [],
     level,
     environment: ctx.config.environment || '',
-    release: ctx.config.release || '',
+    release: ctx.release,
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -568,7 +606,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
     stackTrace: [],
     level,
     environment: ctx.config.environment || '',
-    release: ctx.config.release || '',
+    release: ctx.release,
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -641,10 +679,14 @@ export function allstakFastify(
   const tracesSampleRate =
     typeof config.tracesSampleRate === 'number' ? clamp01(config.tracesSampleRate) : sampleRate;
   const random = config.random || Math.random;
+  // Resolve the release once at registration: explicit > env > local git
+  // (Node runtime, cached one-shot) > SDK version. Reused by every emitted
+  // event for this plugin instance.
+  const release = releaseOf(config);
 
   // Register this plugin instance as the active capture context so module-level
   // captureException/captureMessage route through this transport + pipeline.
-  activeContext = { transport, config, extraRedact, sampleRate, random };
+  activeContext = { transport, config, extraRedact, sampleRate, random, release };
 
   fastify.addHook('onRequest', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
     // Establish a fresh, request-isolated scope for the remainder of this
@@ -710,7 +752,7 @@ export function allstakFastify(
           parentSpanId: request.allstakParentSpanId || '',
           requestId: request.allstakRequestId || '',
           environment: config.environment || '',
-          release: config.release || '',
+          release,
           service: config.serviceName || '',
           userId,
           requestHeaders: config.captureRequestHeaders
@@ -744,7 +786,7 @@ export function allstakFastify(
             endTimeMillis: startedAt + durationMs,
             service: config.serviceName || '',
             environment: config.environment || '',
-            release: config.release || '',
+            release,
             tags: {
               component: 'fastify',
               method,
@@ -773,7 +815,7 @@ export function allstakFastify(
       stackTrace: error.stack ? error.stack.split('\n') : [],
       level: 'error',
       environment: config.environment || '',
-      release: config.release || '',
+      release,
       traceId: request.allstakTraceId || '',
       spanId: request.allstakSpanId || '',
       parentSpanId: request.allstakParentSpanId || '',
