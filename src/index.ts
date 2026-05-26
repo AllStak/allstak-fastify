@@ -63,8 +63,22 @@ export interface AllStakFastifyConfig {
   redactKeys?: (string | RegExp)[];
   /** Capture inbound headers (redacted). Default false. */
   captureRequestHeaders?: boolean;
-  /** Fraction 0..1 of requests captured. Default 1. */
+  /**
+   * Fraction 0..1 of error events captured (onError), and the fallback trace
+   * sampling rate when `tracesSampleRate` is not set. Default 1. Applied at
+   * capture time, BEFORE beforeSend.
+   */
   sampleRate?: number;
+  /**
+   * Fraction 0..1 of traces captured when this service is the trace origin
+   * (no inbound sampled flag). Defaults to `sampleRate`. Drives the propagated
+   * W3C `traceparent` sampled flag (`-01` kept / `-00` dropped) and gates
+   * request + span emission. When an inbound `traceparent` carries a sampled
+   * flag, the child inherits it and this rate is not consulted.
+   */
+  tracesSampleRate?: number;
+  /** RNG seam for deterministic tests. Defaults to Math.random. Returns [0,1). */
+  random?: () => number;
   /** Max events per HTTP request. Default 50. */
   maxBatchSize?: number;
   /** Max buffered events before drop-oldest. Default 1000. */
@@ -102,6 +116,7 @@ interface FastifyRequestLike {
   allstakRequestId?: string;
   allstakSpanId?: string;
   allstakParentSpanId?: string;
+  allstakSampled?: boolean;
 }
 
 interface FastifyReplyLike {
@@ -142,19 +157,29 @@ function randomHex(bytes: number): string {
   return Array.from({ length: bytes }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
 }
 
-function parseTraceparent(value: string): { traceId?: string; parentSpanId?: string } {
+function parseTraceparent(value: string): {
+  traceId?: string;
+  parentSpanId?: string;
+  sampled?: boolean;
+} {
   const parts = value.split('-');
   if (parts.length < 4) return {};
+  const flags = parts[3];
+  // trace-flags is a 2-hex-digit field; bit 0 is the "sampled" flag.
+  const sampled = /^[0-9a-fA-F]{2}$/.test(flags ?? '')
+    ? (parseInt(flags, 16) & 0x01) === 0x01
+    : undefined;
   return {
     traceId: parts[1]?.length === 32 ? parts[1] : undefined,
     parentSpanId: parts[2]?.length === 16 ? parts[2] : undefined,
+    sampled,
   };
 }
 
-function traceparent(traceId: string, spanId: string): string {
+function traceparent(traceId: string, spanId: string, sampled: boolean): string {
   const t = traceId.length === 32 ? traceId : randomHex(16);
   const s = spanId.length === 16 ? spanId : randomHex(8);
-  return `00-${t}-${s}-01`;
+  return `00-${t}-${s}-${sampled ? '01' : '00'}`;
 }
 
 function allstakBaggage(traceId: string, requestId: string, spanId: string): string {
@@ -434,6 +459,12 @@ export function allstakFastify(
 
   const extraRedact = compileExtra(config.redactKeys);
   const sampleRate = typeof config.sampleRate === 'number' ? clamp01(config.sampleRate) : 1;
+  // Trace sampling falls back to sampleRate when tracesSampleRate is unset,
+  // preserving the historical behavior where sampleRate gated request/span
+  // capture.
+  const tracesSampleRate =
+    typeof config.tracesSampleRate === 'number' ? clamp01(config.tracesSampleRate) : sampleRate;
+  const random = config.random || Math.random;
 
   fastify.addHook('onRequest', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
     request.allstakStartedAt = Date.now();
@@ -444,12 +475,17 @@ export function allstakFastify(
       headerValue(request.headers, 'x-request-id') ||
       traceId;
     const spanId = randomHex(8);
+    // Trace sampling: inherit an inbound sampled flag (child follows root);
+    // otherwise this service is the trace origin, so decide via
+    // tracesSampleRate and drive the propagated traceparent flag.
+    const sampled = parsed.sampled ?? (tracesSampleRate >= 1 ? true : random() < tracesSampleRate);
     request.allstakTraceId = traceId;
     request.allstakRequestId = requestId;
     request.allstakSpanId = spanId;
+    request.allstakSampled = sampled;
     request.allstakParentSpanId =
       headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
-    reply.header?.('traceparent', traceparent(traceId, spanId));
+    reply.header?.('traceparent', traceparent(traceId, spanId, sampled));
     reply.header?.('baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
     reply.header?.('allstak-baggage', allstakBaggage(traceId, requestId, spanId));
     reply.header?.('x-allstak-trace-id', traceId);
@@ -458,7 +494,9 @@ export function allstakFastify(
   });
 
   fastify.addHook('onResponse', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
-    if (sampleRate < 1 && Math.random() >= sampleRate) {
+    // Trace-not-sampled: skip request + span emission. Decision was made at
+    // onRequest time so the propagated traceparent already carries the flag.
+    if (request.allstakSampled === false) {
       doneHook();
       return;
     }
@@ -533,6 +571,13 @@ export function allstakFastify(
   });
 
   fastify.addHook('onError', (request: FastifyRequestLike, _reply: FastifyReplyLike, error: Error, doneHook: (err?: Error) => void) => {
+    // Error sampling: deterministic random drop at capture time, applied
+    // BEFORE beforeSend (which runs in the transport). Dropped errors never
+    // reach beforeSend.
+    if (sampleRate < 1 && random() >= sampleRate) {
+      doneHook();
+      return;
+    }
     const payload: Record<string, unknown> = {
       exceptionClass: error.name || 'Error',
       message: error.message,
