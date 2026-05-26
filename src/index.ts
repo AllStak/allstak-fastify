@@ -11,6 +11,41 @@ const DEFAULT_MAX_BATCH = 50;
 const DEFAULT_MAX_QUEUE = 1000;
 const DEFAULT_FLUSH_INTERVAL_MS = 2000;
 const DEFAULT_MAX_RETRIES = 3;
+/** Upper bound for any honored Retry-After delay. */
+const MAX_RETRY_AFTER_MS = 300_000;
+
+/**
+ * Parse an HTTP `Retry-After` header into a delay in milliseconds.
+ *
+ * Supports the two RFC 7231 forms:
+ *   - delta-seconds: a non-negative integer (e.g. "120" → 120000ms)
+ *   - HTTP-date: an absolute date; the delta from `now` is returned (clamped ≥ 0)
+ *
+ * Returns 0 when the header is absent, empty, or unparseable so callers can
+ * fall back to their computed backoff. The result is clamped to
+ * MAX_RETRY_AFTER_MS (300000). Pure and side-effect free.
+ */
+export function parseRetryAfter(headerValue: string | null, now: number): number {
+  if (headerValue == null) return 0;
+  const raw = headerValue.trim();
+  if (raw === '') return 0;
+
+  let ms: number;
+  if (/^\d+$/.test(raw)) {
+    // delta-seconds: a bare non-negative integer.
+    const seconds = Number(raw);
+    if (!Number.isFinite(seconds) || seconds < 0) return 0;
+    ms = seconds * 1000;
+  } else {
+    // HTTP-date form.
+    const when = Date.parse(raw);
+    if (Number.isNaN(when)) return 0;
+    const delta = when - now;
+    ms = delta > 0 ? delta : 0;
+  }
+
+  return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
 
 // Per-version Symbol so two different versions of @allstak/fastify in the same
 // process do not silently hand each other the same "already registered" flag.
@@ -313,9 +348,18 @@ class FastifyTransport {
         lastErr = err;
         if (attempt === this.maxRetries) break;
         if (!isRetryable(err)) break;
-        const base = Math.min(8000, 500 * 2 ** attempt);
-        const jitter = Math.floor(Math.random() * (base / 4));
-        await new Promise((r) => setTimeout(r, base + jitter));
+        // Honor a server-provided Retry-After on 429/503 when present;
+        // otherwise fall back to exponential backoff with jitter.
+        const retryAfterMs = (err as { retryAfterMs?: number })?.retryAfterMs ?? 0;
+        let wait: number;
+        if (retryAfterMs > 0) {
+          wait = Math.min(retryAfterMs, MAX_RETRY_AFTER_MS);
+        } else {
+          const base = Math.min(8000, 500 * 2 ** attempt);
+          const jitter = Math.floor(Math.random() * (base / 4));
+          wait = base + jitter;
+        }
+        await new Promise((r) => setTimeout(r, wait));
       }
     }
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -348,6 +392,13 @@ class FastifyTransport {
       if (!resp.ok) {
         const err = new Error(`AllStak fastify ingest HTTP ${resp.status}`);
         (err as Error & { status?: number }).status = resp.status;
+        if (resp.status === 429 || resp.status === 503) {
+          const headerValue = resp.headers?.get?.('Retry-After') ?? null;
+          (err as Error & { retryAfterMs?: number }).retryAfterMs = parseRetryAfter(
+            headerValue,
+            Date.now(),
+          );
+        }
         throw err;
       }
     } finally {

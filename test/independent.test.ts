@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import allstakDefault, { allstakFastify, FastifyTransport, SDK_NAME, SDK_VERSION } from '../src/index';
+import allstakDefault, { allstakFastify, FastifyTransport, SDK_NAME, SDK_VERSION, parseRetryAfter } from '../src/index';
 import pkg from '../package.json';
 
 type Hook = (...args: any[]) => void;
@@ -231,5 +231,43 @@ describe('@allstak/fastify — plugin', () => {
   it('default and named export are the same plugin function', () => {
     expect(typeof allstakDefault).toBe('function');
     expect(typeof allstakFastify).toBe('function');
+  });
+});
+
+describe('@allstak/fastify — parseRetryAfter', () => {
+  const NOW = 1_700_000_000_000;
+
+  it('parses delta-seconds: "2" → 2000', () => {
+    expect(parseRetryAfter('2', NOW)).toBe(2000);
+  });
+
+  it('parses HTTP-date into a delta-from-now in ms', () => {
+    const future = new Date(NOW + 5000).toUTCString(); // 1s resolution
+    expect(parseRetryAfter(future, NOW)).toBe(5000);
+  });
+
+  it('returns 0 for null and empty string', () => {
+    expect(parseRetryAfter(null, NOW)).toBe(0);
+    expect(parseRetryAfter('', NOW)).toBe(0);
+    expect(parseRetryAfter('   ', NOW)).toBe(0);
+  });
+
+  it('returns 0 for garbage', () => {
+    expect(parseRetryAfter('soon', NOW)).toBe(0);
+    expect(parseRetryAfter('12.5', NOW)).toBe(0);
+    expect(parseRetryAfter('-3', NOW)).toBe(0);
+  });
+
+  it('clamps anything over 300s to 300000', () => {
+    expect(parseRetryAfter('400', NOW)).toBe(300_000);
+    expect(parseRetryAfter('301', NOW)).toBe(300_000);
+    expect(parseRetryAfter('300', NOW)).toBe(300_000);
+    const farFuture = new Date(NOW + 600_000).toUTCString();
+    expect(parseRetryAfter(farFuture, NOW)).toBe(300_000);
+  });
+
+  it('treats a past HTTP-date as 0', () => {
+    const past = new Date(NOW - 5000).toUTCString();
+    expect(parseRetryAfter(past, NOW)).toBe(0);
   });
 });
