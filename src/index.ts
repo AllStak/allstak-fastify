@@ -3,6 +3,7 @@ import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, redactHeadersToString, redactMap } from './redaction';
 import { resolveRelease, type GitRunner } from './release';
 import { SessionTracker } from './session';
+import { FileSpool, nodeRequire, type FileSpoolOptions } from './spool';
 import {
   Scope,
   ScopeManager,
@@ -28,8 +29,12 @@ export {
 export type { GitRunner } from './release';
 export { SessionTracker } from './session';
 export type { SessionStatus } from './session';
+export { FileSpool } from './spool';
+export type { SpoolEnvelope, SpoolFs, FileSpoolOptions } from './spool';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
+/** Default spool directory under the OS tmp dir; resolved lazily, Node-only. */
+const DEFAULT_SPOOL_SUBDIR = 'allstak-fastify-spool';
 const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_MAX_CONCURRENT = 64;
 const DEFAULT_MAX_BATCH = 50;
@@ -146,6 +151,31 @@ export interface AllStakFastifyConfig {
    * `null` to drop. Errors in the hook are caught (fail-open).
    */
   beforeSend?: (event: AllStakOutboundEvent) => AllStakOutboundEvent | null | Promise<AllStakOutboundEvent | null>;
+  /**
+   * Persist un-sent (already PII-scrubbed) telemetry to a filesystem spool when
+   * delivery fails — network outage, retries exhausted, or shutdown with events
+   * still buffered — and replay it on the next init so events survive a process
+   * restart and a network outage (Sentry offline-store parity). Session
+   * lifecycle calls (`/sessions/start`, `/sessions/end`) are never spooled.
+   *
+   * Default true on Node runtimes, but automatically skipped under a unit-test
+   * runtime (NODE_ENV=test / VITEST=true) unless explicitly set true. Degrades
+   * to in-memory silently when the spool dir is not writable (read-only FS,
+   * serverless, edge with no `node:fs`). Set false to disable entirely.
+   */
+  enableOfflineQueue?: boolean;
+  /** Spool directory. Default `<os.tmpdir()>/allstak-fastify-spool`. */
+  offlineQueueDir?: string;
+  /** Max spooled envelopes (drop-oldest). Default 200. */
+  offlineQueueMaxEntries?: number;
+  /** Max spooled bytes (drop-oldest). Default ~5 MiB. */
+  offlineQueueMaxBytes?: number;
+  /** Max spooled-envelope age in ms before drop-on-load. Default 48h. */
+  offlineQueueMaxAgeMs?: number;
+  /** fs seam for deterministic spool tests. */
+  offlineQueueFs?: FileSpoolOptions['fs'];
+  /** Clock seam for deterministic spool tests. Defaults to Date.now. */
+  offlineQueueNow?: () => number;
   /** Test injection. */
   fetch?: typeof fetch;
 }
@@ -258,6 +288,44 @@ function shouldAutoSessionTrack(value: boolean | undefined): boolean {
   return !isLikelyTestRuntime();
 }
 
+/**
+ * Whether to persist un-sent telemetry to the filesystem spool. Opt-out via
+ * `enableOfflineQueue: false`; auto-skipped under a unit-test runtime so tests
+ * don't write spool files unless they pass an explicit `enableOfflineQueue: true`
+ * (mirrors the session-tracking / release-registration guards).
+ */
+function shouldEnableOfflineQueue(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  // Only meaningful on a Node runtime; in-memory degrade handles the rest.
+  if (!detectPlatform()) return false;
+  return !isLikelyTestRuntime();
+}
+
+/**
+ * Ingest paths excluded from the persistent spool. Session lifecycle calls are
+ * best-effort live-only — a replayed stale `/sessions/start`/`/sessions/end`
+ * after a restart would skew release-health durations.
+ */
+const NON_PERSISTABLE_PATHS = new Set<AllStakOutboundEvent['path']>([
+  '/ingest/v1/sessions/start',
+  '/ingest/v1/sessions/end',
+]);
+
+/** Resolve the default spool dir under the OS tmp dir (Node only). */
+function defaultSpoolDir(): string | null {
+  try {
+    const req = nodeRequire();
+    if (!req) return null;
+    const os = req('node:os') as { tmpdir?: () => string };
+    const tmp = os.tmpdir?.();
+    if (!tmp) return null;
+    return tmp.endsWith('/') ? `${tmp}${DEFAULT_SPOOL_SUBDIR}` : `${tmp}/${DEFAULT_SPOOL_SUBDIR}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Host platform string for the session payload (e.g. "node-darwin"). */
 function detectPlatform(): string | undefined {
   const proc = (globalThis as {
@@ -352,13 +420,16 @@ class FastifyTransport {
   private readonly maxRetries: number;
   private readonly fetchImpl: typeof fetch;
   private readonly beforeSend?: AllStakFastifyConfig['beforeSend'];
+  private readonly spool: FileSpool | null;
 
   private requestQueue: QueuedEvent[] = [];
   private spanQueue: QueuedEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
   private dropped = 0;
+  private persisted = 0;
   private shuttingDown = false;
+  private draining = false;
 
   constructor(cfg: AllStakFastifyConfig) {
     this.host = normalizeHost(cfg.host || cfg.endpoint);
@@ -371,10 +442,37 @@ class FastifyTransport {
     this.maxRetries = cfg.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.fetchImpl = (cfg.fetch || globalThis.fetch) as typeof fetch;
     this.beforeSend = cfg.beforeSend;
+    // Offline/persistent spool: only constructed when enabled AND a dir resolves.
+    // FileSpool itself fails open (no-op) if the dir is not writable.
+    if (this.apiKey && shouldEnableOfflineQueue(cfg.enableOfflineQueue)) {
+      const dir = cfg.offlineQueueDir ?? defaultSpoolDir();
+      this.spool = dir
+        ? new FileSpool({
+            dir,
+            maxEntries: cfg.offlineQueueMaxEntries,
+            maxBytes: cfg.offlineQueueMaxBytes,
+            maxAgeMs: cfg.offlineQueueMaxAgeMs,
+            fs: cfg.offlineQueueFs,
+            now: cfg.offlineQueueNow,
+          })
+        : null;
+    } else {
+      this.spool = null;
+    }
   }
 
-  stats(): { inFlight: number; dropped: number; queued: number } {
-    return { inFlight: this.inFlight, dropped: this.dropped, queued: this.requestQueue.length + this.spanQueue.length };
+  stats(): { inFlight: number; dropped: number; queued: number; persisted: number } {
+    return {
+      inFlight: this.inFlight,
+      dropped: this.dropped,
+      queued: this.requestQueue.length + this.spanQueue.length,
+      persisted: this.persisted,
+    };
+  }
+
+  /** Whether the persistent offline spool is active and writable. */
+  isOfflineQueueEnabled(): boolean {
+    return !!this.spool && this.spool.isEnabled();
   }
 
   /** No API key ⇒ the transport cannot emit anything. */
@@ -398,6 +496,17 @@ class FastifyTransport {
     while (this.inFlight > 0 && Date.now() - start < timeoutMs) {
       await new Promise((r) => setTimeout(r, 20));
     }
+    // Any events still buffered after the flush window (network was down the
+    // whole time) are persisted so they survive the process exit. Failed
+    // dispatches were already persisted via the catch in dispatch().
+    this.persistRemaining();
+  }
+
+  /** Persist whatever is still queued in-memory to the offline spool. */
+  private persistRemaining(): void {
+    if (!this.spool || !this.spool.isEnabled()) return;
+    const remaining = [...this.requestQueue.splice(0), ...this.spanQueue.splice(0)];
+    for (const { ev } of remaining) this.persistEnvelope(ev);
   }
 
   /** Batched. Used for /http-requests where volume is high. */
@@ -490,16 +599,73 @@ class FastifyTransport {
     }
     if (!outbound) return;
     if (this.inFlight >= this.maxConcurrent) {
-      this.dropped++;
+      // Saturated in-flight window: persist rather than silently drop so the
+      // event survives to the next drain. Falls through to drop if no spool.
+      if (!this.persistEnvelope(outbound)) this.dropped++;
       return;
     }
     this.inFlight++;
     try {
       await this.sendWithRetry(outbound);
-    } catch {
-      // fail-open
+    } catch (err) {
+      // Permanent failure after retries (network outage, 5xx/429 exhausted, or
+      // timeout). Persist the already-scrubbed payload to the offline spool so
+      // it replays on the next init. A 4xx other than 429 is permanently bad
+      // data — never persist it (it would replay forever). Fully fail-open.
+      if (isPersistableFailure(err)) this.persistEnvelope(outbound);
     } finally {
       this.inFlight = Math.max(0, this.inFlight - 1);
+    }
+  }
+
+  /**
+   * Write an envelope's already-scrubbed payload to the offline spool. Session
+   * lifecycle calls are never persisted (a replayed stale session skews
+   * durations). Returns true when it was persisted. Fully fail-open.
+   */
+  private persistEnvelope(ev: AllStakOutboundEvent): boolean {
+    if (!this.spool || !this.spool.isEnabled()) return false;
+    if (NON_PERSISTABLE_PATHS.has(ev.path)) return false;
+    try {
+      this.spool.persist(ev.path, this.scrubPayload(ev.payload as Record<string, unknown>));
+      this.persisted++;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Replay persisted envelopes through the normal send pipeline. Loaded
+   * oldest-first; each file is deleted only after the event is accepted (2xx)
+   * or permanently undeliverable (4xx other than 429). Transient failures keep
+   * the file for the next drain. Async + fail-open; never blocks init.
+   */
+  async drainSpool(): Promise<void> {
+    if (!this.apiKey || this.shuttingDown) return;
+    if (!this.spool || !this.spool.isEnabled() || this.draining) return;
+    this.draining = true;
+    try {
+      const entries = this.spool.load();
+      for (const { envelope, remove } of entries) {
+        if (this.shuttingDown) break;
+        try {
+          await this.sendWithRetry({
+            path: envelope.path as AllStakOutboundEvent['path'],
+            payload: envelope.payload,
+          });
+          remove(); // accepted (2xx)
+        } catch (err) {
+          if (!isPersistableFailure(err)) {
+            remove(); // permanently undeliverable (4xx other than 429)
+          }
+          // else: transient — keep for the next drain.
+        }
+      }
+    } catch {
+      // Spool unreadable: fail-open, keep in-memory behavior.
+    } finally {
+      this.draining = false;
     }
   }
 
@@ -530,25 +696,37 @@ class FastifyTransport {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
+  /**
+   * Defense-in-depth wire scrub. Module-level redactMap already scrubs metadata
+   * at construction; this chokepoint covers any top-level sensitive key that
+   * bypasses that path. Returns the already-scrubbed payload object. Pure and
+   * fail-open. Shared by {@link sendOnce} (wire body) and the offline spool so
+   * the persisted form is byte-identical to what would have been sent.
+   */
+  scrubPayload(payload: Record<string, unknown>): Record<string, unknown> {
+    try {
+      const scrubbed = (redactMap(payload) ?? payload) as Record<string, unknown>;
+      // The SDK's release-health `sessionId` is an opaque id the SDK itself
+      // generates (not a user credential), and the backend REQUIRES it to
+      // correlate errors/sessions. The defense-in-depth scrub matches the
+      // generic `session_id` denylist pattern, so restore the SDK value.
+      const original = payload as { sessionId?: unknown };
+      if (typeof original.sessionId === 'string') {
+        scrubbed.sessionId = original.sessionId;
+      }
+      return scrubbed;
+    } catch {
+      return payload;
+    }
+  }
+
   private async sendOnce(ev: AllStakOutboundEvent): Promise<void> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      // Defense-in-depth wire scrub. Module-level redactMap already
-      // scrubs metadata at construction; this chokepoint covers any
-      // top-level sensitive key that bypasses that path. Pure, fail-open.
       let body: string;
       try {
-        const scrubbed = redactMap(ev.payload as Record<string, unknown>) ?? ev.payload;
-        // The SDK's release-health `sessionId` is an opaque id the SDK itself
-        // generates (not a user credential), and the backend REQUIRES it to
-        // correlate errors/sessions. The defense-in-depth scrub matches the
-        // generic `session_id` denylist pattern, so restore the SDK value.
-        const original = ev.payload as { sessionId?: unknown };
-        if (typeof original.sessionId === 'string') {
-          (scrubbed as Record<string, unknown>).sessionId = original.sessionId;
-        }
-        body = JSON.stringify(scrubbed);
+        body = JSON.stringify(this.scrubPayload(ev.payload as Record<string, unknown>));
       } catch {
         body = JSON.stringify(ev.payload);
       }
@@ -590,6 +768,17 @@ function isRetryable(err: unknown): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Whether a failed send should be persisted to the offline spool for later
+ * replay (transient: network error / timeout / 5xx / 429 / 408 retries
+ * exhausted) versus permanently dropped (a 4xx other than 429/408 is bad data
+ * the server will keep rejecting). Mirrors {@link isRetryable}: anything worth
+ * retrying live is worth persisting across a restart/outage.
+ */
+function isPersistableFailure(err: unknown): boolean {
+  return isRetryable(err);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -973,24 +1162,42 @@ export function allstakFastify(
     doneHook();
   });
 
-  if (session) {
-    // Open the release-health session once the server is ready to accept
-    // traffic. Fire-and-forget; never blocks startup.
+  // A single onReady/onClose pair drives BOTH release-health sessions and the
+  // offline spool (the test harness keys hooks by name, so one registration of
+  // each keeps that and real Fastify happy). Registered when either feature is
+  // active.
+  const offlineQueueOn = transport.isOfflineQueueEnabled();
+  if (session || offlineQueueOn) {
     fastify.addHook('onReady', (doneHook: (err?: Error) => void) => {
-      try {
-        session.start();
-      } catch {
-        // Session tracking is fully fail-open.
+      // Open the release-health session once the server is ready to accept
+      // traffic. Fire-and-forget; never blocks startup.
+      if (session) {
+        try {
+          session.start();
+        } catch {
+          // Session tracking is fully fail-open.
+        }
+      }
+      // Replay any telemetry persisted by a previous run (restart/outage
+      // recovery). Async + fail-open; never blocks startup or the hook.
+      if (offlineQueueOn) {
+        void transport.drainSpool();
       }
       doneHook();
     });
-    // Close the session on graceful shutdown with the accumulated status and
-    // total duration. Best-effort; must not block or throw.
     fastify.addHook('onClose', (_instance: unknown, doneHook: (err?: Error) => void) => {
-      try {
-        session.end();
-      } catch {
-        // Best-effort.
+      // Close the session on graceful shutdown with the accumulated status and
+      // total duration, then flush + persist any still-buffered telemetry so it
+      // survives the process exit. Best-effort; must not block or throw.
+      if (session) {
+        try {
+          session.end();
+        } catch {
+          // Best-effort.
+        }
+      }
+      if (offlineQueueOn) {
+        void transport.shutdown();
       }
       doneHook();
     });
