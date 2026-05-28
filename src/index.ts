@@ -2,6 +2,7 @@ import fp from 'fastify-plugin';
 import { SDK_NAME, SDK_VERSION } from './version';
 import { compileExtra, redactHeadersToString, redactMap } from './redaction';
 import { resolveRelease, type GitRunner } from './release';
+import { SessionTracker } from './session';
 import {
   Scope,
   ScopeManager,
@@ -25,6 +26,8 @@ export {
   type ResolveReleaseOptions,
 } from './release';
 export type { GitRunner } from './release';
+export { SessionTracker } from './session';
+export type { SessionStatus } from './session';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 const DEFAULT_TIMEOUT_MS = 3000;
@@ -95,6 +98,15 @@ export interface AllStakFastifyConfig {
    * plugin registration, without requiring a CI/CD hook. Default true.
    */
   autoRegisterRelease?: boolean;
+  /**
+   * Open one release-health session per process: POST `/sessions/start` on the
+   * Fastify `onReady` hook and POST `/sessions/end` on `onClose` with the final
+   * status (ok / errored / crashed) and total duration. Sessions are never
+   * sampled and the network calls are fully fail-open. Default true; set false
+   * to opt out. Automatically skipped under a unit-test runtime (NODE_ENV=test
+   * or VITEST=true), like release auto-registration.
+   */
+  enableAutoSessionTracking?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. */
@@ -139,7 +151,13 @@ export interface AllStakFastifyConfig {
 }
 
 export interface AllStakOutboundEvent {
-  path: '/ingest/v1/http-requests' | '/ingest/v1/errors' | '/ingest/v1/spans' | '/ingest/v1/releases';
+  path:
+    | '/ingest/v1/http-requests'
+    | '/ingest/v1/errors'
+    | '/ingest/v1/spans'
+    | '/ingest/v1/releases'
+    | '/ingest/v1/sessions/start'
+    | '/ingest/v1/sessions/end';
   payload: Record<string, unknown>;
 }
 
@@ -163,7 +181,10 @@ interface FastifyReplyLike {
 }
 
 interface FastifyLike {
-  addHook(name: 'onRequest' | 'onResponse' | 'onError', fn: (...args: any[]) => void): void;
+  addHook(
+    name: 'onRequest' | 'onResponse' | 'onError' | 'onReady' | 'onClose',
+    fn: (...args: any[]) => void,
+  ): void;
 }
 
 function normalizeHost(host?: string): string {
@@ -213,6 +234,37 @@ function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
   } catch {
     return true;
   }
+}
+
+/** True when running under a unit-test runtime (mirrors the Java SDK guard). */
+function isLikelyTestRuntime(): boolean {
+  try {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    return env?.NODE_ENV === 'test' || env?.VITEST === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether to open a release-health session for this registration. Opt-out via
+ * `enableAutoSessionTracking: false`; auto-skipped under a unit-test runtime so
+ * tests don't hit `/ingest/v1/sessions/start` unless they pass an explicit
+ * `enableAutoSessionTracking: true`.
+ */
+function shouldAutoSessionTrack(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  return !isLikelyTestRuntime();
+}
+
+/** Host platform string for the session payload (e.g. "node-darwin"). */
+function detectPlatform(): string | undefined {
+  const proc = (globalThis as {
+    process?: { platform?: string; versions?: { node?: string } };
+  }).process;
+  if (!proc?.versions?.node) return undefined;
+  return proc.platform ? `node-${proc.platform}` : 'node';
 }
 
 function pathOnly(url: string): string {
@@ -323,6 +375,11 @@ class FastifyTransport {
 
   stats(): { inFlight: number; dropped: number; queued: number } {
     return { inFlight: this.inFlight, dropped: this.dropped, queued: this.requestQueue.length + this.spanQueue.length };
+  }
+
+  /** No API key ⇒ the transport cannot emit anything. */
+  isDisabled(): boolean {
+    return !this.apiKey;
   }
 
   async forceFlush(): Promise<void> {
@@ -483,6 +540,14 @@ class FastifyTransport {
       let body: string;
       try {
         const scrubbed = redactMap(ev.payload as Record<string, unknown>) ?? ev.payload;
+        // The SDK's release-health `sessionId` is an opaque id the SDK itself
+        // generates (not a user credential), and the backend REQUIRES it to
+        // correlate errors/sessions. The defense-in-depth scrub matches the
+        // generic `session_id` denylist pattern, so restore the SDK value.
+        const original = ev.payload as { sessionId?: unknown };
+        if (typeof original.sessionId === 'string') {
+          (scrubbed as Record<string, unknown>).sessionId = original.sessionId;
+        }
         body = JSON.stringify(scrubbed);
       } catch {
         body = JSON.stringify(ev.payload);
@@ -549,6 +614,8 @@ interface ActiveCaptureContext {
   random: () => number;
   /** Release resolved once at registration (explicit > env > git > version). */
   release: string;
+  /** Release-health session for this registration, or null when disabled. */
+  session: SessionTracker | null;
 }
 
 let activeContext: ActiveCaptureContext | null = null;
@@ -612,6 +679,9 @@ function buildErrorPayload(
       ...(extra ?? {}),
     },
   };
+  // Carry the release-health session id so the backend's error consumer can
+  // mark the session errored / crashed.
+  if (ctx.session) payload.sessionId = ctx.session.sessionId;
   return applyScopeToErrorPayload(payload, ctx.extraRedact, scopeManager.getMerged());
 }
 
@@ -623,9 +693,14 @@ function buildErrorPayload(
 export function captureException(error: unknown, hint?: { extra?: Record<string, unknown>; level?: Severity }): void {
   const ctx = activeContext;
   if (!ctx) return;
+  const level = hint?.level ?? 'error';
+  // Status transition is independent of sampling: a fatal manually-captured
+  // exception crashes the session even if the event itself is sampled out.
+  if (level === 'fatal') ctx.session?.recordCrash();
+  else ctx.session?.recordError();
   if (ctx.sampleRate < 1 && ctx.random() >= ctx.sampleRate) return;
   const err = error instanceof Error ? error : new Error(String(error));
-  const payload = buildErrorPayload(err, ctx, hint?.level ?? 'error', hint?.extra);
+  const payload = buildErrorPayload(err, ctx, level, hint?.extra);
   ctx.transport.sendNow({ path: '/ingest/v1/errors', payload });
 }
 
@@ -650,6 +725,7 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
       service: ctx.config.serviceName || '',
     },
   };
+  if (ctx.session) payload.sessionId = ctx.session.sessionId;
   applyScopeToErrorPayload(payload, ctx.extraRedact, scopeManager.getMerged());
   ctx.transport.sendNow({ path: '/ingest/v1/errors', payload });
 }
@@ -727,9 +803,21 @@ export function allstakFastify(
   const release = releaseOf(config);
   registerRuntimeRelease(config, transport, release);
 
+  // Release-health: one session per process. Created here (no I/O yet); the
+  // /sessions/start POST fires on the Fastify onReady hook and /sessions/end on
+  // onClose. Skipped when disabled or under a unit-test runtime. Sessions are
+  // never sampled and every call is fully fail-open.
+  const session: SessionTracker | null = shouldAutoSessionTrack(config.enableAutoSessionTracking)
+    ? new SessionTracker(transport, {
+        release,
+        environment: config.environment,
+        platform: detectPlatform(),
+      })
+    : null;
+
   // Register this plugin instance as the active capture context so module-level
   // captureException/captureMessage route through this transport + pipeline.
-  activeContext = { transport, config, extraRedact, sampleRate, random, release };
+  activeContext = { transport, config, extraRedact, sampleRate, random, release, session };
 
   fastify.addHook('onRequest', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
     // Establish a fresh, request-isolated scope for the remainder of this
@@ -844,6 +932,10 @@ export function allstakFastify(
   });
 
   fastify.addHook('onError', (request: FastifyRequestLike, _reply: FastifyReplyLike, error: Error, doneHook: (err?: Error) => void) => {
+    // A request-handler error is a HANDLED error for release-health: it bumps
+    // the session to "errored" but keeps it running. Recorded before sampling
+    // so a sampled-out error still affects crash-free rate.
+    session?.recordError();
     // Error sampling: deterministic random drop at capture time, applied
     // BEFORE beforeSend (which runs in the transport). Dropped errors never
     // reach beforeSend.
@@ -871,12 +963,38 @@ export function allstakFastify(
         httpPath: pathOnly(request.url),
       },
     };
+    // Carry the release-health session id so the backend's error consumer can
+    // mark the session errored / crashed. Only set when a session is active.
+    if (session) payload.sessionId = session.sessionId;
     // Merge the active request scope (user/tags/extras/contexts/breadcrumbs)
     // and apply redaction.
     applyScopeToErrorPayload(payload, extraRedact, merged);
     transport.sendNow({ path: '/ingest/v1/errors', payload });
     doneHook();
   });
+
+  if (session) {
+    // Open the release-health session once the server is ready to accept
+    // traffic. Fire-and-forget; never blocks startup.
+    fastify.addHook('onReady', (doneHook: (err?: Error) => void) => {
+      try {
+        session.start();
+      } catch {
+        // Session tracking is fully fail-open.
+      }
+      doneHook();
+    });
+    // Close the session on graceful shutdown with the accumulated status and
+    // total duration. Best-effort; must not block or throw.
+    fastify.addHook('onClose', (_instance: unknown, doneHook: (err?: Error) => void) => {
+      try {
+        session.end();
+      } catch {
+        // Best-effort.
+      }
+      doneHook();
+    });
+  }
 
   done?.();
 }
