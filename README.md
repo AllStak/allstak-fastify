@@ -58,6 +58,12 @@ Sensitive header and metadata keys are redacted before telemetry is sent. Add `r
 - Missing request correlation: keep upstream `traceparent` or `x-request-id` headers when proxying traffic.
 - Short-lived tests or scripts: wait briefly or call the plugin transport shutdown in your test harness.
 
+## Contributing and Support
+
+- Report bugs with the GitHub bug report template: https://github.com/AllStak/allstak-fastify/issues/new/choose
+- Open pull requests using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report security vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT

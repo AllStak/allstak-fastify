@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible SDK bug
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please include enough detail for maintainers to reproduce the behavior without access to your production system.
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: Package version or commit SHA.
+      placeholder: "1.2.3"
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and framework
+      description: Language/runtime/framework versions.
+      placeholder: "Node 20 + Next.js 14, Python 3.12 + FastAPI, Swift 5.9 + iOS 17"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps, sample code, or a small repository link.
+      placeholder: |
+        1. Install ...
+        2. Initialize ...
+        3. Trigger ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove API keys, tokens, cookies, private URLs, and user data before pasting.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed secrets, API keys, tokens, cookies, and private customer data from this issue.
+          required: true
+        - label: I checked the README and existing issues for the same problem.
+          required: true

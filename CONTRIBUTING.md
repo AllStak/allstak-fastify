@@ -1,31 +1,46 @@
-# Contributing to AllStak SDKs
+# Contributing to AllStak Fastify SDK
 
-Thank you for your interest in contributing! Please read this guide before submitting a pull request.
+Thanks for helping improve this SDK. Keep pull requests focused, reproducible, and easy to review.
 
-## Getting Started
+## Development Setup
 
-1. Fork this repository and create a branch from `develop`.
-2. Install dependencies (see README for language-specific instructions).
-3. Make your changes with clear, focused commits.
-4. Run the full test suite and ensure all tests pass.
-5. Open a pull request against the `develop` branch.
 
-## Branch Strategy
+default branch on GitHub is the source of truth for pull requests. Fork the repository, create a topic branch from the default branch shown by GitHub, and open your PR back to that same default branch.
 
-- `main` — production-ready, protected. Only merged from `develop` via PR.
-- `develop` — active development branch. All feature branches target this.
+
+environment setup:
+
+```bash
+npm install
+```
+
+## Verification
+
+Run the strongest relevant checks before opening a PR:
+
+```bash
+npm run build\nnpm test
+```
+
+For documentation-only changes, run the formatting or build checks that apply to the touched files.
 
 ## Pull Request Guidelines
 
-- PRs must pass all CI checks before merge.
-- Include a clear description of the change and why it's needed.
-- Link any related issues.
-- Keep PRs focused — one concern per PR.
+- Explain the bug or workflow the PR fixes.
+- Include a minimal reproduction for bug fixes when possible.
+- Add or update tests when behavior changes.
+- Update README or docs when public API, config, install steps, or behavior changes.
+- Keep secrets, API keys, tokens, cookies, private URLs, and customer data out of issues, logs, tests, and commits.
+- Keep public copy focused on AllStak behavior. Do not add external vendor names, migration positioning, or internal implementation notes.
+
+## Security
+
+Do not open public issues for vulnerabilities. Email security@allstak.sa or use GitHub Security Advisories for this repository.
 
 ## Code of Conduct
 
-Be respectful, constructive, and collaborative. We expect all contributors to follow the [Contributor Covenant](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
+Be respectful, constructive, and collaborative. Contributors are expected to follow the Contributor Covenant: https://www.contributor-covenant.org/version/2/1/code_of_conduct/
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the same [MIT License](LICENSE) as the project.
+By contributing, you agree that your contributions will be licensed under this repository's license.
