@@ -29,7 +29,7 @@ The version number is intentionally left for the release gate to assign.
   `SpoolEnvelope` / `SpoolFs` / `FileSpoolOptions` exports.
 
 ### Added — Value-pattern PII scrubbing + sendDefaultPii
-- Value-pattern (not just key-name) PII scrubbing with Sentry data-scrubbing
+- Value-pattern (not just key-name) PII scrubbing with data-scrubbing
   parity: always redacts Luhn-valid credit-card numbers and hyphenated US SSNs;
   redacts email addresses and valid IPv4/IPv6 unless `sendDefaultPii` is true
   (default false). Conservative matchers (Luhn checksum, literal SSN hyphens)
