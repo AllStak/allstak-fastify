@@ -143,7 +143,28 @@ interface AsyncScopeStorage {
   enterWith?(store: Scope[]): void;
 }
 
-type AsyncLocalStorageCtor = new <T>() => AsyncScopeStorage;
+/**
+ * Active-request trace context, carried in its own AsyncLocalStorage store so
+ * code running inside a request's async chain (e.g. outbound HTTP egress
+ * captured via diagnostics_channel) can continue the same distributed trace
+ * without threading the Fastify request object through every layer.
+ */
+export interface TraceContext {
+  traceId: string;
+  /** The current server span id — becomes the parent of outbound client spans. */
+  spanId: string;
+  requestId: string;
+  /** W3C sampled flag for this trace; drives the propagated `-01`/`-00`. */
+  sampled: boolean;
+}
+
+interface AsyncTraceStorage {
+  getStore(): TraceContext | undefined;
+  run<T>(store: TraceContext, callback: () => T): T;
+  enterWith?(store: TraceContext): void;
+}
+
+type AsyncLocalStorageCtor = new <T>() => AsyncScopeStorage & AsyncTraceStorage;
 
 /**
  * Resolve Node's AsyncLocalStorage without a static `import 'node:async_hooks'`
@@ -188,6 +209,16 @@ function createAsyncScopeStorage(): AsyncScopeStorage | null {
   }
 }
 
+function createAsyncTraceStorage(): AsyncTraceStorage | null {
+  const Ctor = loadAsyncLocalStorage();
+  if (!Ctor) return null;
+  try {
+    return new Ctor<TraceContext>();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Module-level scope manager. Holds a global (process-wide) scope plus an
  * AsyncLocalStorage-backed per-request stack. Capture paths read the active
@@ -197,6 +228,7 @@ function createAsyncScopeStorage(): AsyncScopeStorage | null {
 export class ScopeManager {
   private readonly globalScope = new Scope();
   private readonly als: AsyncScopeStorage | null = createAsyncScopeStorage();
+  private readonly traceAls: AsyncTraceStorage | null = createAsyncTraceStorage();
 
   /** The active scope stack: ALS request stack when inside a request, else [globalScope]. */
   private stack(): Scope[] {
@@ -287,5 +319,29 @@ export class ScopeManager {
   /** Mutate the active scope in place. */
   configureScope(callback: (scope: Scope) => void): void {
     callback(this.getCurrentScope());
+  }
+
+  /**
+   * Bind the current request's trace context for the remainder of this async
+   * context using `AsyncLocalStorage.enterWith`. Mirrors {@link enterRequestScope}
+   * — designed for the Fastify `onRequest` hook. Lets outbound HTTP egress
+   * (captured out-of-band via diagnostics_channel, but running inside the
+   * request's async chain) continue the same distributed trace. No-ops without
+   * ALS so older runtimes degrade to trace-origin behavior.
+   */
+  enterTraceContext(ctx: TraceContext): void {
+    if (!this.traceAls || typeof this.traceAls.enterWith !== 'function') return;
+    this.traceAls.enterWith(ctx);
+  }
+
+  /** The active request's trace context, or undefined when outside a request. */
+  getTraceContext(): TraceContext | undefined {
+    return this.traceAls?.getStore();
+  }
+
+  /** @internal — run `callback` inside an explicit trace context (tests). */
+  runInTraceContext<T>(ctx: TraceContext, callback: () => T): T {
+    if (this.traceAls) return this.traceAls.run(ctx, callback);
+    return callback();
   }
 }

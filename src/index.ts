@@ -4,6 +4,7 @@ import { compileExtra, redactHeadersToString, redactMap, scrubValuesDeep } from 
 import { resolveRelease, type GitRunner } from './release';
 import { SessionTracker } from './session';
 import { FileSpool, nodeRequire, type FileSpoolOptions } from './spool';
+import { OutboundInstrumentation, type OutboundInstrumentationOptions } from './outbound';
 import {
   Scope,
   ScopeManager,
@@ -31,6 +32,13 @@ export { SessionTracker } from './session';
 export type { SessionStatus } from './session';
 export { FileSpool } from './spool';
 export type { SpoolEnvelope, SpoolFs, FileSpoolOptions } from './spool';
+export { OutboundInstrumentation } from './outbound';
+export type {
+  OutboundInstrumentationOptions,
+  OutboundTransportLike,
+  OutboundTraceContext,
+  DiagnosticsChannelModule,
+} from './outbound';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 /** Default spool directory under the OS tmp dir; resolved lazily, Node-only. */
@@ -135,6 +143,24 @@ export interface AllStakFastifyConfig {
   /** Capture inbound headers (redacted). Default false. */
   captureRequestHeaders?: boolean;
   /**
+   * Instrument OUTBOUND HTTP egress (the calls this service makes) via Node's
+   * `diagnostics_channel` undici client channels — which back global `fetch`,
+   * `undici.request`, and most modern HTTP clients. For each egress request the
+   * SDK injects W3C `traceparent` + `baggage` (continuing the current inbound
+   * request's trace context, reusing the same AsyncLocalStorage scope) so
+   * downstream services join the distributed trace, and emits a client span +
+   * an outbound `HttpRequestPayload` (`direction: 'outbound'`). The SDK's own
+   * ingest host is always skipped. Default true; fully fail-open (a subscriber
+   * error never breaks the host's outbound call). No-ops off a Node runtime or
+   * when `diagnostics_channel` is unavailable.
+   */
+  captureOutboundHttp?: boolean;
+  /**
+   * diagnostics_channel module seam for deterministic outbound-instrumentation
+   * tests. Defaults to the real `node:diagnostics_channel`.
+   */
+  diagnosticsChannel?: OutboundInstrumentationOptions['diagnosticsChannel'];
+  /**
    * Fraction 0..1 of error events captured (onError), and the fallback trace
    * sampling rate when `tracesSampleRate` is not set. Default 1. Applied at
    * capture time, BEFORE beforeSend.
@@ -237,6 +263,16 @@ function normalizeHost(host?: string): string {
   return (host || DEFAULT_HOST).replace(/\/$/, '');
 }
 
+/** Hostname (no scheme/port) of the ingest endpoint; used to skip self-egress. */
+function ingestHostname(host?: string): string {
+  const normalized = normalizeHost(host);
+  try {
+    return new URL(normalized).hostname;
+  } catch {
+    return normalized.replace(/^[a-z]+:\/\//i, '').split('/')[0]?.split(':')[0] ?? '';
+  }
+}
+
 /**
  * Resolve the effective release for a config: explicit `release` > env vars >
  * local git at init > SDK version. The git lookup is cached one-shot inside
@@ -315,6 +351,23 @@ function shouldEnableOfflineQueue(value: boolean | undefined): boolean {
   if (value === true) return true;
   // Only meaningful on a Node runtime; in-memory degrade handles the rest.
   if (!detectPlatform()) return false;
+  return !isLikelyTestRuntime();
+}
+
+/**
+ * Whether to install outbound HTTP egress instrumentation. Defaults ON. Like
+ * the session-tracking / offline-queue gates it auto-skips under a unit-test
+ * runtime unless explicitly enabled — but a test that injects a fake
+ * `diagnosticsChannel` is treating outbound as the system under test, so that
+ * counts as an explicit opt-in. Only meaningful on a Node runtime; the
+ * instrumentation itself no-ops where diagnostics_channel is unavailable.
+ */
+function shouldCaptureOutbound(config: AllStakFastifyConfig): boolean {
+  if (config.captureOutboundHttp === false) return false;
+  if (!detectPlatform()) return false;
+  if (config.captureOutboundHttp === true) return true;
+  // A fake diagnostics channel means a test is exercising outbound directly.
+  if (config.diagnosticsChannel) return true;
   return !isLikelyTestRuntime();
 }
 
@@ -1033,6 +1086,30 @@ export function allstakFastify(
   // captureException/captureMessage route through this transport + pipeline.
   activeContext = { transport, config, extraRedact, sampleRate, random, release, session };
 
+  // Outbound HTTP egress instrumentation: inject W3C traceparent/baggage onto
+  // the calls this service makes (continuing the inbound request's trace via
+  // the ALS trace context bound in onRequest) and emit client spans + outbound
+  // http-request rows. Skips the SDK's own ingest host. Fully fail-open; no-ops
+  // off Node / where diagnostics_channel is unavailable.
+  const outbound: OutboundInstrumentation | null = shouldCaptureOutbound(config)
+    ? new OutboundInstrumentation({
+        transport,
+        getTraceContext: () => scopeManager.getTraceContext(),
+        ingestHost: ingestHostname(config.host || config.endpoint),
+        environment: config.environment,
+        release,
+        serviceName: config.serviceName,
+        diagnosticsChannel: config.diagnosticsChannel,
+      })
+    : null;
+  if (outbound) {
+    try {
+      outbound.install();
+    } catch {
+      // Instrumentation install is fully fail-open.
+    }
+  }
+
   fastify.addHook('onRequest', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
     // Establish a fresh, request-isolated scope for the remainder of this
     // request's async context so user/tags set in a handler don't leak across
@@ -1056,6 +1133,10 @@ export function allstakFastify(
     request.allstakSampled = sampled;
     request.allstakParentSpanId =
       headerValue(request.headers, 'x-allstak-parent-span-id') || parsed.parentSpanId;
+    // Bind this request's trace context to ALS so outbound egress captured
+    // out-of-band (diagnostics_channel) can continue the SAME trace. The server
+    // span id becomes the parent of every outbound client span.
+    scopeManager.enterTraceContext({ traceId, spanId, requestId, sampled });
     reply.header?.('traceparent', traceparent(traceId, spanId, sampled));
     reply.header?.('baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
     reply.header?.('allstak-baggage', allstakBaggage(traceId, requestId, spanId));
@@ -1192,7 +1273,7 @@ export function allstakFastify(
   // each keeps that and real Fastify happy). Registered when either feature is
   // active.
   const offlineQueueOn = transport.isOfflineQueueEnabled();
-  if (session || offlineQueueOn) {
+  if (session || offlineQueueOn || outbound) {
     fastify.addHook('onReady', (doneHook: (err?: Error) => void) => {
       // Open the release-health session once the server is ready to accept
       // traffic. Fire-and-forget; never blocks startup.
@@ -1223,6 +1304,16 @@ export function allstakFastify(
       }
       if (offlineQueueOn) {
         void transport.shutdown();
+      }
+      // Stop instrumenting egress once the server is closing so a closed plugin
+      // instance does not keep emitting from leftover diagnostics-channel
+      // subscriptions (matters most for tests that open/close many apps).
+      if (outbound) {
+        try {
+          outbound.uninstall();
+        } catch {
+          // Best-effort.
+        }
       }
       doneHook();
     });
