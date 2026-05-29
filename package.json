@@ -1,6 +1,6 @@
 {
   "name": "@allstak/fastify",
-  "version": "0.1.0-beta.5",
+  "version": "0.1.0",
   "description": "AllStak SDK for Fastify (beta). Plugin with redaction, batching, retry, sampling, and beforeSend.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -47,7 +47,7 @@
     "vitest": "^1.6.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "MIT"
 }

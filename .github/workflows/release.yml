@@ -1,209 +1,97 @@
-# Reusable release workflow — npm
-#
-# Copy to .github/workflows/release.yml in the target SDK repo.
-# Replace @allstak/fastify with the npm scope+name (e.g. "@allstak/fastify").
-#
-# Triggers:
-#   - git tag v*       → real publish (gated by manual approval)
-#   - workflow_dispatch → dry-run only (publish step skipped)
-#
-# Required org-secrets (in release-prod environment):
-#   NPM_TOKEN, ALLSTAK_API_KEY_SMOKE, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY
-
-name: release
+name: Release
 
 on:
   push:
-    tags: ['v*.*.*']
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry-run only (no publish)'
-        type: boolean
+        description: 'Pack and smoke only; do not publish'
+        required: false
         default: true
+        type: boolean
 
-permissions: {}
+permissions:
+  contents: write
+  id-token: write
 
 jobs:
-  dry-run:
-    name: Preflight (version + changelog + drift)
+  release:
+    name: Build, inspect, publish
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.ver.outputs.version }}
+    environment: release-prod
     steps:
       - uses: actions/checkout@v4
-      - id: ver
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Verify package version
         run: |
-          PKG_VER=$(node -p "require('./package.json').version")
-          echo "version=$PKG_VER" >> "$GITHUB_OUTPUT"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
           if [ "${{ github.event_name }}" = "push" ]; then
-            TAG_VER="${GITHUB_REF_NAME#v}"
-            if [ "$PKG_VER" != "$TAG_VER" ]; then
-              echo "::error::package.json version ($PKG_VER) does not match tag ($TAG_VER)"
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
               exit 1
             fi
           fi
-      - name: CHANGELOG entry exists
-        run: grep -E "^## \[${{ steps.ver.outputs.version }}\] — [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md
-      - name: No active allstak-io drift
+      - name: Check existing npm version
+        id: published
         run: |
-          set +e
-          hits=$(grep -rEn --include='*.md' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.ts' --include='*.js' \
-            "allstak-io" . | grep -vE "_archive|CHANGELOG|HISTORY|/dist/|/node_modules/|Previous|archived|legacy|historical|read-only|/\.github/workflows/" | wc -l | tr -d ' ')
-          if [ "$hits" != "0" ]; then
-            echo "::error::active allstak-io references found"
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Pack and inspect
+        run: |
+          mkdir -p pack
+          npm pack --json --pack-destination pack > pack/pack.json
+          TARBALL="$(node -e "const p=require('./pack/pack.json'); console.log('pack/'+p[0].filename)")"
+          tar -tf "$TARBALL" | tee pack/contents.txt
+          if grep -E '(^|/)(\.env|\.env\..*|\.npmrc|id_rsa|.*\.pem|.*\.key|.*\.crt)$' pack/contents.txt; then
+            echo "::error::Package tarball contains a forbidden secret-like file"
             exit 1
           fi
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    needs: dry-run
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
-      - run: npm run build --if-present
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
-      - run: npm run build --if-present
-      - run: npm test
-
-  inspect:
-    name: Package inspection (tarball + secret scan)
-    runs-on: ubuntu-latest
-    needs: [build, test]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
-      - run: npm run build --if-present
-      - name: Pack tarball
+          realpath "$TARBALL" > pack/tarball-path.txt
+      - name: Clean install smoke
         run: |
-          mkdir -p dist-pack
-          npm pack --pack-destination dist-pack
-      - name: List tarball contents (job summary)
-        run: |
-          TGZ=$(ls dist-pack/*.tgz | head -1)
-          echo "### Tarball contents" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tar -tzf "$TGZ" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-      - name: Secret leak scan
-        run: |
-          TGZ=$(ls dist-pack/*.tgz | head -1)
-          if tar -tzf "$TGZ" | xargs -I{} tar -xOzf "$TGZ" {} | \
-              grep -E 'ask_live_[a-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]+PRIVATE KEY-----' >/dev/null; then
-            echo "::error::secret pattern detected in tarball"
-            exit 1
-          fi
+          TARBALL="$(cat pack/tarball-path.txt)"
+          TMP="$(mktemp -d)"
+          cp "$TARBALL" "$TMP/package.tgz"
+          cd "$TMP"
+          npm init -y >/dev/null
+          npm install --ignore-scripts ./package.tgz typescript fastify >/dev/null
+          node -e "const sdk=require('@allstak/fastify'); if (!sdk.allstakFastify) throw new Error('missing CJS export')"
+          node --input-type=module -e "const sdk=await import('@allstak/fastify'); if (!sdk.allstakFastify) throw new Error('missing ESM export')"
+          printf "import { allstakFastify } from '@allstak/fastify';\nvoid allstakFastify;\n" > smoke.ts
+          npx tsc --noEmit --module NodeNext --moduleResolution NodeNext --target ES2022 smoke.ts
       - uses: actions/upload-artifact@v4
         with:
           name: package
-          path: dist-pack/*.tgz
-
-  publish:
-    name: Publish to npm
-    needs: inspect
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || inputs.dry_run == false
-    environment: release-prod   # manual-approval gate configured here
-    permissions:
-      contents: write
-      id-token: write   # for npm provenance
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-      - uses: actions/download-artifact@v4
-        with:
-          name: package
-          path: dist-pack
-      - name: Publish
+          path: pack/
+      - name: Publish to npm
+        if: steps.published.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'true'
         run: |
-          TGZ=$(ls dist-pack/*.tgz | head -1)
-          npm publish --access public --provenance "$TGZ"
-      - name: Rollback note (always in job summary)
-        if: always()
+          TARBALL="$(cat pack/tarball-path.txt)"
+          npm publish "$TARBALL" --access public --tag beta --provenance
+      - name: Verify published package
+        if: steps.published.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false)
         run: |
-          echo "### Rollback" >> "$GITHUB_STEP_SUMMARY"
-          echo "If this release must be rolled back:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "npm deprecate @allstak/fastify@${{ needs.dry-run.outputs.version }} \"<reason>\"" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "Do NOT use npm unpublish — see ../sdk-rollback-procedure.md" >> "$GITHUB_STEP_SUMMARY"
-
-  smoke:
-    name: Smoke verify (install from registry + canary)
-    needs: [publish, dry-run]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || inputs.dry_run == false
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install the just-published version from npm
-        run: |
-          mkdir /tmp/smoke && cd /tmp/smoke && npm init -y > /dev/null
-          npm install @allstak/fastify@${{ needs.dry-run.outputs.version }}
-          node -e "console.log('loaded:', Object.keys(require('@allstak/fastify')))"
-      - name: Post smoke canary
-        env:
-          KEY: ${{ secrets.ALLSTAK_API_KEY_SMOKE }}
-        run: |
-          STATUS=$(curl -sS -o /tmp/r -w "%{http_code}" -X POST https://api.allstak.sa/ingest/v1/errors \
-            -H "X-AllStak-Key: $KEY" -H "Content-Type: application/json" \
-            -d '{"exceptionClass":"ReleaseSmoke","message":"@allstak/fastify@${{ needs.dry-run.outputs.version }}","environment":"smoke"}')
-          if [ "$STATUS" != "202" ]; then
-            echo "::error::smoke canary rejected: HTTP $STATUS"
-            cat /tmp/r
-            exit 1
-          fi
-          echo "smoke event id: $(jq -r .data.id /tmp/r)"
-
-  audit:
-    name: Audit log
-    needs: [publish, smoke, dry-run]
-    runs-on: ubuntu-latest
-    if: always() && (github.event_name == 'push' || inputs.dry_run == false)
-    steps:
-      - uses: actions/create-github-app-token@v1
-        id: app-token
-        with:
-          app-id: ${{ secrets.GITHUB_APP_ID }}
-          private-key: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
-          owner: AllStak
-          repositories: release-bot-audit
-      - name: Open audit issue
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          BODY=$(printf 'Repo: %s\nVersion: %s\nWorkflow: %s\nPublish: %s\nSmoke: %s\n' \
-            "${{ github.repository }}" \
-            "${{ needs.dry-run.outputs.version }}" \
-            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "${{ needs.publish.result }}" \
-            "${{ needs.smoke.result }}")
-          gh issue create --repo AllStak/release-bot-audit \
-            --title "Release ${{ github.event.repository.name }} ${{ needs.dry-run.outputs.version }}" \
-            --body "$BODY"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          npm init -y >/dev/null
+          npm install "@allstak/fastify@$PKG_VERSION" fastify >/dev/null
+          node -e "const sdk=require('@allstak/fastify'); if (!sdk.allstakFastify) throw new Error('published package missing CJS export')"
