@@ -1,6 +1,6 @@
 import fp from 'fastify-plugin';
 import { SDK_NAME, SDK_VERSION } from './version';
-import { compileExtra, redactHeadersToString, redactMap } from './redaction';
+import { compileExtra, redactHeadersToString, redactMap, scrubValuesDeep } from './redaction';
 import { resolveRelease, type GitRunner } from './release';
 import { SessionTracker } from './session';
 import { FileSpool, nodeRequire, type FileSpoolOptions } from './spool';
@@ -116,6 +116,22 @@ export interface AllStakFastifyConfig {
   gitRunner?: GitRunner;
   /** Extra attribute key patterns to redact. */
   redactKeys?: (string | RegExp)[];
+  /**
+   * Send personally-identifiable information (PII) that the SDK would otherwise
+   * scrub out of free-text values. Default FALSE (Sentry parity).
+   *
+   * When FALSE: email addresses and valid IPv4/IPv6 addresses found in event
+   * messages, metadata/extra/context values, breadcrumbs, and captured HTTP
+   * fields are replaced with `[REDACTED]`, and any auto-collected client IP is
+   * dropped/masked. When TRUE: those value scrubbers are disabled (you have
+   * opted into PII) and an auto-collected client IP is allowed through.
+   *
+   * High-risk financial/identity data (Luhn-valid credit-card numbers and
+   * hyphenated US SSNs) is ALWAYS scrubbed regardless of this flag, as is the
+   * existing key-name redaction (password/token/cookie/…). Explicitly-set user
+   * data (via `setUser`) is never scrubbed by this flag, matching Sentry.
+   */
+  sendDefaultPii?: boolean;
   /** Capture inbound headers (redacted). Default false. */
   captureRequestHeaders?: boolean;
   /**
@@ -420,6 +436,7 @@ class FastifyTransport {
   private readonly maxRetries: number;
   private readonly fetchImpl: typeof fetch;
   private readonly beforeSend?: AllStakFastifyConfig['beforeSend'];
+  private readonly sendDefaultPii: boolean;
   private readonly spool: FileSpool | null;
 
   private requestQueue: QueuedEvent[] = [];
@@ -442,6 +459,9 @@ class FastifyTransport {
     this.maxRetries = cfg.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.fetchImpl = (cfg.fetch || globalThis.fetch) as typeof fetch;
     this.beforeSend = cfg.beforeSend;
+    // sendDefaultPii defaults FALSE (Sentry parity): value-pattern email/IP
+    // scrubbing is ON unless the user explicitly opts into PII.
+    this.sendDefaultPii = cfg.sendDefaultPii === true;
     // Offline/persistent spool: only constructed when enabled AND a dir resolves.
     // FileSpool itself fails open (no-op) if the dir is not writable.
     if (this.apiKey && shouldEnableOfflineQueue(cfg.enableOfflineQueue)) {
@@ -705,7 +725,12 @@ class FastifyTransport {
    */
   scrubPayload(payload: Record<string, unknown>): Record<string, unknown> {
     try {
-      const scrubbed = (redactMap(payload) ?? payload) as Record<string, unknown>;
+      // Layer 1: key-name redaction (password/token/cookie/…) replaces values
+      // whose KEY looks sensitive. Layer 2: value-pattern PII scrubbing scans
+      // free-text string values (CC/SSN always; email/IP unless sendDefaultPii).
+      // Both fail open independently — see redaction.ts.
+      const keyRedacted = (redactMap(payload) ?? payload) as Record<string, unknown>;
+      const scrubbed = scrubValuesDeep(keyRedacted, this.sendDefaultPii);
       // The SDK's release-health `sessionId` is an opaque id the SDK itself
       // generates (not a user credential), and the backend REQUIRES it to
       // correlate errors/sessions. The defense-in-depth scrub matches the

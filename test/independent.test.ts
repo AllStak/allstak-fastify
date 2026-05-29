@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import allstakDefault, { allstakFastify, FastifyTransport, SDK_NAME, SDK_VERSION, parseRetryAfter } from '../src/index';
+import allstakDefault, { allstakFastify, FastifyTransport, SDK_NAME, SDK_VERSION, parseRetryAfter, setUser } from '../src/index';
 import pkg from '../package.json';
 
 type Hook = (...args: any[]) => void;
@@ -231,6 +231,76 @@ describe('@allstak/fastify — plugin', () => {
   it('default and named export are the same plugin function', () => {
     expect(typeof allstakDefault).toBe('function');
     expect(typeof allstakFastify).toBe('function');
+  });
+});
+
+describe('@allstak/fastify — value-pattern PII scrubbing on the wire', () => {
+  it('scrubs email/IPv4 and Luhn-valid CC/SSN out of an error message by default (sendDefaultPii=false)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    const { app, hooks } = makeApp();
+    allstakFastify(app, {
+      apiKey: 'ask_dev_test',
+      flushIntervalMs: 0,
+      fetch: fetchSpy as unknown as typeof fetch,
+    });
+    const err = new Error('user jane@example.com from 203.0.113.9 card 4111111111111111 ssn 123-45-6789');
+    hooks.onError({ method: 'POST', url: '/x', headers: { host: 'h' } }, { statusCode: 500, header: () => {} }, err, () => {});
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const payload = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(payload.message).toBe('user [REDACTED] from [REDACTED] card [REDACTED] ssn [REDACTED]');
+  });
+
+  it('preserves email/IPv4 in free text when sendDefaultPii=true, but still scrubs CC/SSN', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    const { app, hooks } = makeApp();
+    allstakFastify(app, {
+      apiKey: 'ask_dev_test',
+      flushIntervalMs: 0,
+      sendDefaultPii: true,
+      fetch: fetchSpy as unknown as typeof fetch,
+    });
+    const err = new Error('user jane@example.com from 203.0.113.9 card 4111111111111111 ssn 123-45-6789');
+    hooks.onError({ method: 'POST', url: '/x', headers: { host: 'h' } }, { statusCode: 500, header: () => {} }, err, () => {});
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const payload = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(payload.message).toBe('user jane@example.com from 203.0.113.9 card [REDACTED] ssn [REDACTED]');
+  });
+
+  it('does NOT scrub an explicitly set user email (setUser ships verbatim)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    const { app, hooks } = makeApp();
+    allstakFastify(app, {
+      apiKey: 'ask_dev_test',
+      flushIntervalMs: 0,
+      fetch: fetchSpy as unknown as typeof fetch,
+    });
+    setUser({ id: 'u-1', email: 'explicit@example.com' });
+    try {
+      const err = new Error('boom');
+      hooks.onError({ method: 'POST', url: '/x', headers: { host: 'h' } }, { statusCode: 500, header: () => {} }, err, () => {});
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+      const payload = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(payload.metadata.userEmail).toBe('explicit@example.com');
+      expect(payload.metadata.userId).toBe('u-1');
+    } finally {
+      setUser(null);
+    }
+  });
+
+  it('does NOT corrupt stack frame file paths even with an IP-like segment', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true });
+    const { app, hooks } = makeApp();
+    allstakFastify(app, {
+      apiKey: 'ask_dev_test',
+      flushIntervalMs: 0,
+      fetch: fetchSpy as unknown as typeof fetch,
+    });
+    const err = new Error('boom');
+    err.stack = 'Error: boom\n    at handler (/srv/app/192.168.0.1/index.js:10:5)';
+    hooks.onError({ method: 'POST', url: '/x', headers: { host: 'h' } }, { statusCode: 500, header: () => {} }, err, () => {});
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const payload = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(payload.stackTrace.join('\n')).toContain('/srv/app/192.168.0.1/index.js:10:5');
   });
 });
 
