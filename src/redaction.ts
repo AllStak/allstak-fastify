@@ -77,7 +77,7 @@ function escape(s: string): string {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Value-pattern PII scrubbing (Sentry data-scrubbing parity).
+// Value-pattern PII scrubbing.
 //
 // The key-based redaction above replaces a value when its KEY looks sensitive
 // (password/token/cookie/…). This second layer scans free-text string VALUES
@@ -86,7 +86,7 @@ function escape(s: string): string {
 //   A) ALWAYS scrubbed (high-risk financial/identity), independent of any
 //      opt-in: Luhn-valid credit-card numbers and hyphenated US SSNs.
 //   B) Scrubbed UNLESS `sendDefaultPii` is true: email addresses and valid
-//      IPv4 addresses. Default false = Sentry parity.
+//      IPv4 addresses. Default false = privacy-by-default.
 //
 // Conservative by design: the CC matcher requires a Luhn checksum pass so digit
 // runs like order ids / timestamps are preserved, and SSN requires the literal
@@ -179,8 +179,8 @@ export function scrubStringValue(input: string, sendDefaultPii: boolean): string
 
 /**
  * Keys whose string values are intentional/structural and must NOT be value
- * scrubbed: explicitly-set user identity (Sentry does not strip explicit user
- * data even with sendDefaultPii=false), stack-frame source fields,
+ * scrubbed: explicitly-set user identity (explicit user data is preserved
+ * even with sendDefaultPii=false), stack-frame source fields,
  * release/version/sdk identity, span/operation names, URLs/paths (covered by
  * the dedicated URL redactor), and the SDK's own correlation ids. Matched
  * case-insensitively against the leaf key only.

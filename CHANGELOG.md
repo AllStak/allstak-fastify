@@ -4,10 +4,55 @@ All notable changes to @allstak/fastify will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]## [0.1.0] — 2026-05-29
+## [0.2.0] — 2026-05-30
 
-Features landed on `main` since `v0.1.0-beta.4`, staged for the next release.
-The version number is intentionally left for the release gate to assign.
+Auto-instrumentation wave: the listed features are now AUTOMATIC (default-on,
+near-zero config) after `register`. Each is individually toggleable and fully
+fail-open; existing behavior is preserved.
+
+### Added — Process-global crash handlers
+- Installs `process.on('uncaughtException')` + `process.on('unhandledRejection')`
+  once per process (Symbol-guarded). A fatal crash that escapes Fastify is now
+  captured at `fatal` level through the normal capture pipeline, records a crash
+  on the release-health session (`SessionTracker.recordCrash`), is flushed
+  synchronously within a bounded budget, then preserves Node's exit semantics
+  (force-exit only when no app-owned `uncaughtException` listener exists;
+  `unhandledRejection` never force-exits). Gated by `enableCrashHandlers`
+  (default on). New `installCrashHandlers` export.
+
+### Added — Database auto-instrumentation
+- Monkey-patches `pg`, `mysql2`, and the SQLite family (`better-sqlite3` /
+  `sqlite3` / `node:sqlite`) at registration so queries produce
+  `POST /ingest/v1/db` rows automatically: normalized SQL, stable hash, query
+  type, duration, status, rows affected, plus the active request's trace/span
+  ids. Drivers are optional host peer deps (a missing driver turns that one
+  integration off). Batched + fail-open. Gated by `enableDbInstrumentation`
+  (default on). New `DbInstrumentation` / `DbQueryItem` exports and
+  `normalizeQuery` / `hashQuery` / `detectQueryType` helpers.
+
+### Added — pino log bridge
+- Wraps Fastify's pino logger (root + per-request child loggers) so application
+  and framework logs ship to `POST /ingest/v1/logs` automatically; the original
+  pino call is preserved (stdout logs unchanged). Error/fatal logs are promoted
+  with throwable details folded into the log metadata, and every log is stamped
+  with the active request's trace/span/request ids. Value-scrubbed for PII.
+  Gated by `enableLogBridge` (default on) with `logBridgeMinLevel`. New
+  `LogBridge` / `parsePinoArgs` exports.
+
+### Added — Automatic HTTP breadcrumbs
+- An `http` breadcrumb (`http.server`) is recorded on the active request scope
+  for every inbound request, so an error captured during that request carries it
+  as context with no per-call `addBreadcrumb`. Gated by `enableAutoBreadcrumbs`
+  (default on).
+
+### Transport
+- New batched `/ingest/v1/db` and per-record `/ingest/v1/logs` queues alongside
+  the existing `/http-requests` and `/spans` batching, sharing the same
+  redaction, retry/backoff, offline-spool, and `beforeSend` pipeline.
+
+## [0.1.0] — 2026-05-29
+
+Features landed on `main` since `v0.1.0-beta.4`.
 
 ### Added — Release-health session tracking
 - Per-process release-health sessions: `POST /ingest/v1/sessions/start` on the
@@ -76,7 +121,7 @@ Lands the full SDK source on the canonical AllStak repo (`redaction.ts`, `versio
 - `FastifyTransport.sendOnce` scrubs full payload before `JSON.stringify` — defense-in-depth. Pure, fail-open.
 
 ### Live canary E2E
-- Event `2420ed8c-3c2a-4c48-85d3-7d47b9d35400` against `api.allstak.sa`. ClickHouse `leak_pos = 0` across all columns. Canary `should_not_leak_fastify` in 11 fields + 3-level-nested token — all scrubbed.
+- Verified against `api.allstak.sa`: zero leak positions across all ingested fields. Canary `should_not_leak_fastify` in 11 fields + 3-level-nested token — all scrubbed.
 
 ### Tests
 - 16/16 vitest pass.

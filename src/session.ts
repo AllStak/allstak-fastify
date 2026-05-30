@@ -4,7 +4,7 @@ import { SDK_NAME, SDK_VERSION } from './version';
  * Lifecycle status of a release-health session.
  *
  * Mirrors the AllStak Java SDK's `SessionStatus` and the backend's
- * `/ingest/v1/sessions/end` contract / Sentry release-health conventions:
+ * `/ingest/v1/sessions/end` contract / release-health conventions:
  *   - `ok`       — session ended normally with at most non-fatal logs.
  *   - `errored`  — at least one HANDLED error landed during the session, but
  *                  the process kept running.

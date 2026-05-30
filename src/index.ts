@@ -5,6 +5,9 @@ import { resolveRelease, type GitRunner } from './release';
 import { SessionTracker } from './session';
 import { FileSpool, nodeRequire, type FileSpoolOptions } from './spool';
 import { OutboundInstrumentation, type OutboundInstrumentationOptions } from './outbound';
+import { DbInstrumentation } from './db';
+import { LogBridge, type PinoLikeLogger } from './logs';
+import { installCrashHandlers, type CrashHandlerHandle } from './crash';
 import {
   Scope,
   ScopeManager,
@@ -39,6 +42,12 @@ export type {
   OutboundTraceContext,
   DiagnosticsChannelModule,
 } from './outbound';
+export { DbInstrumentation, normalizeQuery, hashQuery, detectQueryType } from './db';
+export type { DbInstrumentationOptions, DbTransportLike, DbQueryItem, DbTraceContext } from './db';
+export { LogBridge, parsePinoArgs } from './logs';
+export type { LogBridgeOptions, LogTransportLike, LogTraceContext, PinoLikeLogger, LogBridgeLevel } from './logs';
+export { installCrashHandlers } from './crash';
+export type { CrashHandlerHooks, CrashHandlerHandle, CrashProcessLike } from './crash';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 /** Default spool directory under the OS tmp dir; resolved lazily, Node-only. */
@@ -126,7 +135,7 @@ export interface AllStakFastifyConfig {
   redactKeys?: (string | RegExp)[];
   /**
    * Send personally-identifiable information (PII) that the SDK would otherwise
-   * scrub out of free-text values. Default FALSE (Sentry parity).
+   * scrub out of free-text values. Default FALSE (privacy-by-default).
    *
    * When FALSE: email addresses and valid IPv4/IPv6 addresses found in event
    * messages, metadata/extra/context values, breadcrumbs, and captured HTTP
@@ -137,7 +146,7 @@ export interface AllStakFastifyConfig {
    * High-risk financial/identity data (Luhn-valid credit-card numbers and
    * hyphenated US SSNs) is ALWAYS scrubbed regardless of this flag, as is the
    * existing key-name redaction (password/token/cookie/…). Explicitly-set user
-   * data (via `setUser`) is never scrubbed by this flag, matching Sentry.
+   * data (via `setUser`) is never scrubbed by this flag.
    */
   sendDefaultPii?: boolean;
   /** Capture inbound headers (redacted). Default false. */
@@ -160,6 +169,50 @@ export interface AllStakFastifyConfig {
    * tests. Defaults to the real `node:diagnostics_channel`.
    */
   diagnosticsChannel?: OutboundInstrumentationOptions['diagnosticsChannel'];
+  /**
+   * Auto-instrument the popular Node SQL drivers (`pg`, `mysql2`, and the
+   * SQLite family) at plugin registration so database queries produce
+   * `/ingest/v1/db` rows AUTOMATICALLY — normalized SQL, query type, duration,
+   * status, rows-affected, plus the active request's trace/span ids. Drivers
+   * are optional host peer deps: a missing driver simply turns that one
+   * integration off. Fully fail-open (a capture error never breaks a query).
+   * Default true; auto-skipped under a unit-test runtime unless explicitly
+   * enabled or a `dbModuleResolver` is provided (which signals a test exercising
+   * DB capture directly). No-ops off a Node runtime.
+   */
+  enableDbInstrumentation?: boolean;
+  /**
+   * Module resolver seam for deterministic DB-instrumentation tests. Given a
+   * driver id (`pg`, `mysql2`, …) returns the (possibly fake) module or null.
+   * Defaults to a defensive host-app require.
+   */
+  dbModuleResolver?: (id: string) => unknown | null;
+  /**
+   * Bridge Fastify's pino logger to AllStak: wrap the instance logger's level
+   * methods so application + framework logs are shipped to `/ingest/v1/logs`
+   * AUTOMATICALLY (your stdout logs are unchanged). ERROR/FATAL logs are
+   * promoted with throwable extraction, and every log is stamped with the
+   * active request's trace/span/request ids. Default true; auto-skipped under a
+   * unit-test runtime unless explicitly enabled. Fully fail-open.
+   */
+  enableLogBridge?: boolean;
+  /** Minimum log level forwarded to AllStak. Default 'info'. */
+  logBridgeMinLevel?: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
+  /**
+   * Automatically record an `http` breadcrumb for every inbound request onto
+   * the active request scope, so a subsequently captured error carries the
+   * request as context with no per-call `addBreadcrumb`. Default true.
+   */
+  enableAutoBreadcrumbs?: boolean;
+  /**
+   * Install process-global `uncaughtException` / `unhandledRejection` handlers
+   * (once per process, Symbol-guarded) so a fatal crash that escapes Fastify is
+   * still captured at `fatal` level, marks the release-health session crashed,
+   * and is flushed before the process exits per Node semantics. Default true;
+   * auto-skipped under a unit-test runtime unless explicitly enabled. Fully
+   * fail-open and preserves Node's default exit behavior.
+   */
+  enableCrashHandlers?: boolean;
   /**
    * Fraction 0..1 of error events captured (onError), and the fallback trace
    * sampling rate when `tracesSampleRate` is not set. Default 1. Applied at
@@ -197,7 +250,7 @@ export interface AllStakFastifyConfig {
    * Persist un-sent (already PII-scrubbed) telemetry to a filesystem spool when
    * delivery fails — network outage, retries exhausted, or shutdown with events
    * still buffered — and replay it on the next init so events survive a process
-   * restart and a network outage (Sentry offline-store parity). Session
+   * restart and a network outage (offline persistent store). Session
    * lifecycle calls (`/sessions/start`, `/sessions/end`) are never spooled.
    *
    * Default true on Node runtimes, but automatically skipped under a unit-test
@@ -227,6 +280,8 @@ export interface AllStakOutboundEvent {
     | '/ingest/v1/http-requests'
     | '/ingest/v1/errors'
     | '/ingest/v1/spans'
+    | '/ingest/v1/db'
+    | '/ingest/v1/logs'
     | '/ingest/v1/releases'
     | '/ingest/v1/sessions/start'
     | '/ingest/v1/sessions/end';
@@ -257,6 +312,13 @@ interface FastifyLike {
     name: 'onRequest' | 'onResponse' | 'onError' | 'onReady' | 'onClose',
     fn: (...args: any[]) => void,
   ): void;
+  /**
+   * Fastify's pino logger instance (present on a real Fastify app). Typed as
+   * `unknown` so this minimal structural type stays assignable from the real
+   * `FastifyInstance` (whose `FastifyBaseLogger` lacks a string index
+   * signature); narrowed to {@link PinoLikeLogger} at the install site.
+   */
+  log?: unknown;
 }
 
 function normalizeHost(host?: string): string {
@@ -368,6 +430,50 @@ function shouldCaptureOutbound(config: AllStakFastifyConfig): boolean {
   if (config.captureOutboundHttp === true) return true;
   // A fake diagnostics channel means a test is exercising outbound directly.
   if (config.diagnosticsChannel) return true;
+  return !isLikelyTestRuntime();
+}
+
+/**
+ * Whether to auto-instrument SQL drivers. Defaults ON. Auto-skips under a
+ * unit-test runtime unless explicitly enabled — but a test that injects a fake
+ * `dbModuleResolver` is treating DB capture as the system under test, so that
+ * counts as an explicit opt-in. Only meaningful on a Node runtime.
+ */
+function shouldInstrumentDb(config: AllStakFastifyConfig): boolean {
+  if (config.enableDbInstrumentation === false) return false;
+  if (!detectPlatform()) return false;
+  if (config.enableDbInstrumentation === true) return true;
+  if (config.dbModuleResolver) return true;
+  return !isLikelyTestRuntime();
+}
+
+/**
+ * Whether to attach the pino log bridge. Defaults ON. Auto-skips under a
+ * unit-test runtime unless explicitly enabled (a wrapped global logger could
+ * otherwise leak across tests). Only meaningful on a Node runtime.
+ */
+function shouldBridgeLogs(config: AllStakFastifyConfig): boolean {
+  if (config.enableLogBridge === false) return false;
+  if (!detectPlatform()) return false;
+  if (config.enableLogBridge === true) return true;
+  return !isLikelyTestRuntime();
+}
+
+/** Whether to record an auto http breadcrumb per request. Defaults ON. */
+function shouldAutoBreadcrumb(value: boolean | undefined): boolean {
+  return value !== false;
+}
+
+/**
+ * Whether to install the process-global crash handlers. Defaults ON. Auto-skips
+ * under a unit-test runtime unless explicitly enabled (a process-global
+ * listener installed during a test would persist across the whole suite). Only
+ * meaningful on a Node runtime.
+ */
+function shouldInstallCrashHandlers(config: AllStakFastifyConfig): boolean {
+  if (config.enableCrashHandlers === false) return false;
+  if (!detectPlatform()) return false;
+  if (config.enableCrashHandlers === true) return true;
   return !isLikelyTestRuntime();
 }
 
@@ -494,6 +600,8 @@ class FastifyTransport {
 
   private requestQueue: QueuedEvent[] = [];
   private spanQueue: QueuedEvent[] = [];
+  private dbQueue: QueuedEvent[] = [];
+  private logQueue: QueuedEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
   private dropped = 0;
@@ -512,7 +620,7 @@ class FastifyTransport {
     this.maxRetries = cfg.maxRetries ?? DEFAULT_MAX_RETRIES;
     this.fetchImpl = (cfg.fetch || globalThis.fetch) as typeof fetch;
     this.beforeSend = cfg.beforeSend;
-    // sendDefaultPii defaults FALSE (Sentry parity): value-pattern email/IP
+    // sendDefaultPii defaults FALSE (privacy-by-default): value-pattern email/IP
     // scrubbing is ON unless the user explicitly opts into PII.
     this.sendDefaultPii = cfg.sendDefaultPii === true;
     // Offline/persistent spool: only constructed when enabled AND a dir resolves.
@@ -538,7 +646,11 @@ class FastifyTransport {
     return {
       inFlight: this.inFlight,
       dropped: this.dropped,
-      queued: this.requestQueue.length + this.spanQueue.length,
+      queued:
+        this.requestQueue.length +
+        this.spanQueue.length +
+        this.dbQueue.length +
+        this.logQueue.length,
       persisted: this.persisted,
     };
   }
@@ -560,6 +672,8 @@ class FastifyTransport {
     }
     await this.drainRequests();
     await this.drainSpans();
+    await this.drainDb();
+    await this.drainLogs();
   }
 
   async shutdown(timeoutMs = 1500): Promise<void> {
@@ -578,7 +692,12 @@ class FastifyTransport {
   /** Persist whatever is still queued in-memory to the offline spool. */
   private persistRemaining(): void {
     if (!this.spool || !this.spool.isEnabled()) return;
-    const remaining = [...this.requestQueue.splice(0), ...this.spanQueue.splice(0)];
+    const remaining = [
+      ...this.requestQueue.splice(0),
+      ...this.spanQueue.splice(0),
+      ...this.dbQueue.splice(0),
+      ...this.logQueue.splice(0),
+    ];
     for (const { ev } of remaining) this.persistEnvelope(ev);
   }
 
@@ -612,6 +731,36 @@ class FastifyTransport {
     }
   }
 
+  /** Batched. Used for /db where every query emits a row. */
+  enqueueDb(ev: AllStakOutboundEvent): void {
+    if (!this.apiKey || this.shuttingDown) return;
+    if (this.dbQueue.length >= this.maxQueueSize) {
+      this.dbQueue.shift();
+      this.dropped++;
+    }
+    this.dbQueue.push({ ev });
+    if (this.flushIntervalMs <= 0 || this.dbQueue.length >= this.maxBatchSize) {
+      void this.drainDb();
+    } else {
+      this.scheduleFlush();
+    }
+  }
+
+  /** Batched. Used for /logs forwarded from the pino bridge. */
+  enqueueLog(ev: AllStakOutboundEvent): void {
+    if (!this.apiKey || this.shuttingDown) return;
+    if (this.logQueue.length >= this.maxQueueSize) {
+      this.logQueue.shift();
+      this.dropped++;
+    }
+    this.logQueue.push({ ev });
+    if (this.flushIntervalMs <= 0 || this.logQueue.length >= this.maxBatchSize) {
+      void this.drainLogs();
+    } else {
+      this.scheduleFlush();
+    }
+  }
+
   /** Single-shot. Used for /errors. */
   sendNow(ev: AllStakOutboundEvent): void {
     if (!this.apiKey || this.shuttingDown) return;
@@ -622,7 +771,12 @@ class FastifyTransport {
     if (this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      void Promise.all([this.drainRequests(), this.drainSpans()]);
+      void Promise.all([
+        this.drainRequests(),
+        this.drainSpans(),
+        this.drainDb(),
+        this.drainLogs(),
+      ]);
     }, this.flushIntervalMs);
     const t = this.timer as unknown as { unref?: () => void };
     if (typeof t.unref === 'function') t.unref();
@@ -658,6 +812,29 @@ class FastifyTransport {
         payload: { spans: merged },
       };
       await this.dispatch(mergedEv);
+    }
+  }
+
+  private async drainDb(): Promise<void> {
+    while (this.dbQueue.length > 0) {
+      const batch = this.dbQueue.splice(0, this.maxBatchSize);
+      // Merge per-event `queries` arrays into one /db POST.
+      const merged: Record<string, unknown>[] = [];
+      for (const { ev } of batch) {
+        const rows = (ev.payload as { queries?: unknown[] }).queries;
+        if (Array.isArray(rows)) merged.push(...(rows as Record<string, unknown>[]));
+      }
+      if (merged.length === 0) continue;
+      await this.dispatch({ path: '/ingest/v1/db', payload: { queries: merged } });
+    }
+  }
+
+  private async drainLogs(): Promise<void> {
+    // Logs ship one LogIngestPayload per POST (single-record contract), so we
+    // dispatch each queued log event individually rather than merging.
+    while (this.logQueue.length > 0) {
+      const { ev } = this.logQueue.shift()!;
+      await this.dispatch(ev);
     }
   }
 
@@ -1110,6 +1287,70 @@ export function allstakFastify(
     }
   }
 
+  // DB auto-instrumentation: monkey-patch pg / mysql2 / sqlite at registration
+  // so queries produce /ingest/v1/db rows AUTOMATICALLY, stamped with the
+  // active request's trace/span ids. Drivers are optional host peer deps; a
+  // missing driver turns that one integration off. Fully fail-open.
+  const db: DbInstrumentation | null = shouldInstrumentDb(config)
+    ? new DbInstrumentation({
+        transport,
+        getTraceContext: () => {
+          const t = scopeManager.getTraceContext();
+          return t ? { traceId: t.traceId, spanId: t.spanId } : undefined;
+        },
+        service: config.serviceName,
+        environment: config.environment,
+        moduleResolver: config.dbModuleResolver,
+        // Inherit the transport's batching mode: flushIntervalMs <= 0 (test
+        // mode) makes each captured query flush immediately.
+        flushIntervalMs: config.flushIntervalMs,
+      })
+    : null;
+  if (db) {
+    try {
+      db.install();
+    } catch {
+      // Instrumentation install is fully fail-open.
+    }
+  }
+
+  // Logs bridge: wrap Fastify's pino logger so application + framework logs are
+  // shipped to /ingest/v1/logs AUTOMATICALLY (stdout logs unchanged), with
+  // ERROR/FATAL throwable promotion and trace/request id stamping. Installed on
+  // onReady so we wrap the FINAL configured logger. Fully fail-open.
+  const logBridge: LogBridge | null = shouldBridgeLogs(config)
+    ? new LogBridge({
+        transport,
+        getTraceContext: () => {
+          const t = scopeManager.getTraceContext();
+          return t
+            ? { traceId: t.traceId, spanId: t.spanId, requestId: t.requestId }
+            : undefined;
+        },
+        service: config.serviceName,
+        environment: config.environment,
+        release,
+        sendDefaultPii: config.sendDefaultPii === true,
+        minLevel: config.logBridgeMinLevel,
+      })
+    : null;
+
+  // Process-global crash handlers: capture uncaughtException / unhandledRejection
+  // at fatal level, mark the session crashed, flush, then preserve Node's exit
+  // semantics. Installed once per process (Symbol-guarded inside the module).
+  const crashHandle: CrashHandlerHandle | null = shouldInstallCrashHandlers(config)
+    ? installCrashHandlers({
+        captureFatal: (error: unknown) => {
+          // Routes through the active capture context: records the crash on the
+          // session and emits an /errors event at fatal level.
+          captureException(error, { level: 'fatal' });
+        },
+        flush: () => transport.forceFlush(),
+      })
+    : null;
+
+  const autoBreadcrumb = shouldAutoBreadcrumb(config.enableAutoBreadcrumbs);
+
   fastify.addHook('onRequest', (request: FastifyRequestLike, reply: FastifyReplyLike, doneHook: (err?: Error) => void) => {
     // Establish a fresh, request-isolated scope for the remainder of this
     // request's async context so user/tags set in a handler don't leak across
@@ -1137,6 +1378,27 @@ export function allstakFastify(
     // out-of-band (diagnostics_channel) can continue the SAME trace. The server
     // span id becomes the parent of every outbound client span.
     scopeManager.enterTraceContext({ traceId, spanId, requestId, sampled });
+    // Auto http breadcrumb: record the inbound request on the active request
+    // scope so a subsequently captured error (onError or manual
+    // captureException) carries it as context with no per-call addBreadcrumb.
+    if (autoBreadcrumb) {
+      try {
+        scopeManager.getCurrentScope().addBreadcrumb({
+          type: 'http',
+          category: 'http.server',
+          message: `${request.method.toUpperCase()} ${pathOnly(request.url)}`,
+          level: 'info',
+          data: {
+            method: request.method.toUpperCase(),
+            path: pathOnly(request.url),
+            host: requestHost(request),
+            requestId,
+          },
+        });
+      } catch {
+        // Breadcrumb recording is fully fail-open.
+      }
+    }
     reply.header?.('traceparent', traceparent(traceId, spanId, sampled));
     reply.header?.('baggage', mergeBaggage(headerValue(request.headers, 'baggage'), traceId, requestId, spanId));
     reply.header?.('allstak-baggage', allstakBaggage(traceId, requestId, spanId));
@@ -1268,12 +1530,12 @@ export function allstakFastify(
     doneHook();
   });
 
-  // A single onReady/onClose pair drives BOTH release-health sessions and the
-  // offline spool (the test harness keys hooks by name, so one registration of
-  // each keeps that and real Fastify happy). Registered when either feature is
-  // active.
+  // A single onReady/onClose pair drives release-health sessions, the offline
+  // spool, the log bridge, DB instrumentation teardown, and the crash handlers
+  // (the test harness keys hooks by name, so one registration of each keeps
+  // that and real Fastify happy). Registered when any feature is active.
   const offlineQueueOn = transport.isOfflineQueueEnabled();
-  if (session || offlineQueueOn || outbound) {
+  if (session || offlineQueueOn || outbound || db || logBridge || crashHandle) {
     fastify.addHook('onReady', (doneHook: (err?: Error) => void) => {
       // Open the release-health session once the server is ready to accept
       // traffic. Fire-and-forget; never blocks startup.
@@ -1282,6 +1544,15 @@ export function allstakFastify(
           session.start();
         } catch {
           // Session tracking is fully fail-open.
+        }
+      }
+      // Attach the log bridge to the FINAL configured Fastify logger now that
+      // the app is fully built (custom logger / level config is settled).
+      if (logBridge) {
+        try {
+          logBridge.install(fastify.log as PinoLikeLogger | undefined);
+        } catch {
+          // Log bridge install is fully fail-open.
         }
       }
       // Replay any telemetry persisted by a previous run (restart/outage
@@ -1298,6 +1569,31 @@ export function allstakFastify(
       if (session) {
         try {
           session.end();
+        } catch {
+          // Best-effort.
+        }
+      }
+      // Flush DB rows still batched and stop the flush timer.
+      if (db) {
+        try {
+          db.uninstall();
+        } catch {
+          // Best-effort.
+        }
+      }
+      // Restore the original logger so a closed instance stops forwarding.
+      if (logBridge) {
+        try {
+          logBridge.uninstall();
+        } catch {
+          // Best-effort.
+        }
+      }
+      // Remove the process-global crash listeners so a closed plugin instance
+      // (matters most for tests opening/closing many apps) stops handling.
+      if (crashHandle) {
+        try {
+          crashHandle.uninstall();
         } catch {
           // Best-effort.
         }

@@ -3,8 +3,8 @@ import { redactMap } from './redaction';
 declare const module: unknown;
 
 /**
- * Filesystem spool for un-sent telemetry envelopes (the Node/server analogue of
- * Sentry's offline cache / envelope store).
+ * Filesystem spool for un-sent telemetry envelopes (the Node/server offline
+ * cache / envelope store).
  *
  * When an event cannot be delivered (network outage, retries exhausted, or the
  * process is shutting down with events still buffered) the transport writes the
