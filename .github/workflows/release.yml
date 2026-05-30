@@ -85,7 +85,7 @@ jobs:
           NPM_CONFIG_PROVENANCE: 'true'
         run: |
           TARBALL="$(cat pack/tarball-path.txt)"
-          npm publish "$TARBALL" --access public --tag beta --provenance
+          npm publish "$TARBALL" --access public --provenance
       - name: Verify published package
         if: steps.published.outputs.exists != 'true' && (github.event_name == 'push' || inputs.dry_run == false)
         run: |
@@ -93,5 +93,11 @@ jobs:
           TMP="$(mktemp -d)"
           cd "$TMP"
           npm init -y >/dev/null
-          npm install "@allstak/fastify@$PKG_VERSION" fastify >/dev/null
+          # New versions can take a moment to reach the registry read replicas;
+          # retry so propagation lag does not false-fail the release.
+          for attempt in 1 2 3 4 5 6; do
+            npm install "@allstak/fastify@$PKG_VERSION" fastify >/dev/null 2>&1 && break
+            [ "$attempt" = "6" ] && { echo "package not visible after retries" >&2; exit 1; }
+            echo "not visible yet (attempt $attempt) — waiting 20s for registry propagation"; sleep 20
+          done
           node -e "const sdk=require('@allstak/fastify'); if (!sdk.allstakFastify) throw new Error('published package missing CJS export')"
