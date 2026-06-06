@@ -4,6 +4,14 @@ All notable changes to @allstak/fastify will be documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.2] — 2026-06-06
+
+### Fixed
+
+- Added top-level `sdkName`, `sdkVersion`, and `platform` fields to Fastify
+  error payloads so DEV and catalog detail pages can identify the SDK without
+  relying only on nested metadata.
+
 ## [0.2.0] — 2026-05-30
 
 Auto-instrumentation wave: the listed features are now AUTOMATIC (default-on,

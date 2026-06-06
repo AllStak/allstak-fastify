@@ -1116,6 +1116,9 @@ function buildErrorPayload(
     level,
     environment: ctx.config.environment || '',
     release: ctx.release,
+    sdkName: SDK_NAME,
+    sdkVersion: SDK_VERSION,
+    platform: detectPlatform() || '',
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -1163,6 +1166,9 @@ export function captureMessage(message: string, level: Severity = 'info'): void 
     level,
     environment: ctx.config.environment || '',
     release: ctx.release,
+    sdkName: SDK_NAME,
+    sdkVersion: SDK_VERSION,
+    platform: detectPlatform() || '',
     metadata: {
       'sdk.name': SDK_NAME,
       'sdk.version': SDK_VERSION,
@@ -1512,6 +1518,9 @@ export function allstakFastify(
       spanId: request.allstakSpanId || '',
       parentSpanId: request.allstakParentSpanId || '',
       requestId: request.allstakRequestId || '',
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
+      platform: detectPlatform() || '',
       metadata: {
         'sdk.name': SDK_NAME,
         'sdk.version': SDK_VERSION,

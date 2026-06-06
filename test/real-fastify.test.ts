@@ -13,7 +13,7 @@
  */
 import Fastify, { FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import allstakFastify, { allstakFastify as namedExport } from '../src/index';
+import allstakFastify, { SDK_NAME, SDK_VERSION, allstakFastify as namedExport } from '../src/index';
 
 interface IngestCall {
   url: string;
@@ -126,6 +126,9 @@ describe('@allstak/fastify against real Fastify v4', () => {
       expect(errCall.body.traceId).toMatch(/^[0-9a-f]{32}$/);
       expect(errCall.body.requestId).toMatch(/^[0-9a-f]{32}$|^req-/);
       expect(errCall.body.spanId).toMatch(/^[0-9a-f]{16}$/);
+      expect(errCall.body.sdkName).toBe(SDK_NAME);
+      expect(errCall.body.sdkVersion).toBe(SDK_VERSION);
+      expect(errCall.body.platform).toMatch(/^node-/);
     } finally { await app.close(); }
   });
 
